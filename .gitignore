@@ -24,4 +24,20 @@ target
 # Added by cargo
 
 /target
-*.lock
+
+# Application artifacts and local state
+**/node_modules/
+/web/dist/
+/contracts/out/
+/contracts/cache/
+/contracts/broadcast/
+.env
+.env.*
+!.env.example
+*.local
+/runtime/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.key
+*.pem

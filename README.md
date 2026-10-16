@@ -182,3 +182,25 @@ Users can decide which content and which users they want to receive.
 The founding team only retains a limited amount of token issuance authority, subject to predefined rules.
 
 The long-term value of the network depends on the health and usage of the ecosystem, creating an incentive for the founding team to maintain a stable and useful network rather than extracting value through platform fees.
+
+
+## Development layout
+
+This repository uses a Rust workspace: `crates/node` is the node application and
+`crates/protocol` contains shared protocol definitions. `web/` is an independently
+built local management and validation UI; `contracts/` is a Foundry project.
+Multi-node scenarios belong in `tests/scenarios/`, deployment files in `deploy/`.
+
+```sh
+cargo run -p red-leaves
+cargo fmt --all --check
+cargo check --workspace --locked
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+```
+
+The node currently prints a scaffold message; networking and APIs are not implemented.
+For the React + TypeScript + Vite Web prototype, use Node.js 22.12+, run `npm ci` and `npm run dev` in `web/`;
+`npm run build` produces static files. Run `forge build` and `forge test` in
+`contracts/` with Foundry installed; there are no contracts or contract tests yet.
+See component READMEs for boundaries and commands.

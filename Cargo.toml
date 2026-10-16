@@ -1,7 +1,13 @@
-[package]
-name = "red-leaves"
+[workspace]
+members = ["crates/protocol", "crates/node"]
+default-members = ["crates/node"]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
-[dependencies]
-libp2p = {version = "0.56.0", features = ["full"]}
+[workspace.dependencies]
+red-leaves-protocol = { path = "crates/protocol" }
+libp2p = { version = "0.56.0", features = ["full"] }

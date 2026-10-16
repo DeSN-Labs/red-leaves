@@ -10,9 +10,12 @@ red-leaves（红叶）旨在将互联网上的 NAS 及其他设备连接成去�
 
 - `README_zh.md`：中文愿景、功能方案、中继计费与区块链设想。
 - `README.md`：英文项目介绍与技术设计。
-- `data-exchange-protocol.md`：数据交换、路由和消息接口草案。
-- `Cargo.toml`：Rust 包配置，当前版本为 `0.1.0`，使用 Rust 2024 edition，声明 libp2p `0.56.0` 依赖。
-- `src/main.rs`：目前仅输出 `Hello, world!`，尚未实现社交网络功能。
+- `docs/data-exchange-protocol.md`：数据交换、路由和消息接口草案。
+- `Cargo.toml`：Rust workspace，包版本为 `0.1.0`，使用 Rust 2024 edition，共享 libp2p `0.56.0` 依赖。
+- `crates/node/src/main.rs`：节点启动骨架，尚未实现网络与 API。
+- `crates/protocol/`：共享协议库骨架。
+- `web/`、`contracts/`：独立的 Web 和合约工程。
+- `tools/`： 存放工具类文件。
 
 项目处于设计与原型阶段。文档中的功能是目标，不应描述为已经交付。README 同时涉及 Sovereign SDK、OP Stack 和 zkSync OS 等设想，链技术栈尚待明确，不要自行视为已定案。
 
@@ -30,7 +33,7 @@ red-leaves（红叶）旨在将互联网上的 NAS 及其他设备连接成去�
 - 公开服务器可依服务提供方规则审核公开推送内容，设计时区分公开服务与私密通信。
 - 程序运行日志统一使用英文描述；CHANGELOG.md 修改日志使用中文。
 - 错误处理尽量放到顶层，底层函数一般要求用Result返回错误信息。
-- 每次大的修改完成后，总结修改信息记录到CHANGELOG.md文档，总结宜简洁准确，不要过长。
+- 每次大的修改完成后，总结修改信息记录到CHANGELOG.md文档，总结宜简洁准确，不要过长，CHANGELOG.md用于给开发者看，AGENT会话不读取。
 
 ## 开发约定
 

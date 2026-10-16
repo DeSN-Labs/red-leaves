@@ -56,3 +56,23 @@
 2. 创作的内容不受审查
 3. 内容的传播由用户自由选择
 4. 创始团队只持有一定量的代币，只有保持代币价值稳定才能获得收益，与网络使用者利益一致
+
+## 开发与仓库结构
+
+Rust workspace 包含 `crates/node`（节点）和 `crates/protocol`（协议库）；
+`web/` 为独立的测试与本地管理页面，`contracts/` 为 Foundry 合约工程。
+`tests/scenarios/` 保存后续多节点联调，`deploy/` 保存部署配置。
+架构和协作规则见 [仓库决策](docs/architecture/0001-repository-layout.md)。
+
+```sh
+cargo run -p red-leaves
+cargo fmt --all --check
+cargo check --workspace --locked
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+```
+
+当前节点仅输出骨架提示，不运行服务。Web 使用 Node.js 22.12+，执行
+`cd web`、`npm ci`、`npm run dev`；构建使用 `npm run build`。
+合约工程使用 Foundry，执行 `cd contracts` 后运行 `forge build` 和 `forge test`；
+当前尚无合约及合约测试。详见各目录 README。
