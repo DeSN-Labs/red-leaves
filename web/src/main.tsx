@@ -21,8 +21,9 @@ import {
   Wallet,
   X,
 } from "lucide-react";
-import { posts, photo, type Category, type Post } from "./data";
-import { connectWallet, shortAddress } from "./wallet";
+import { posts, photo, type Post } from "./data";
+import { apiBaseUrl, checkNasSession, connectWallet, logoutWallet, sessionExpiresAt, shortAddress } from "./wallet";
+const NasBinding = React.lazy(() => import("./NasBinding").then(module => ({ default: module.NasBinding })));
 import "./styles.css";
 
 function Brand() {
@@ -40,9 +41,10 @@ type Session = { mode: "demo" | "wallet"; address?: string };
 function App() {
   const [session, setSession] = useState<Session | null>(null);
   const [busy, setBusy] = useState(false);
+  const [nasAvailable, setNasAvailable] = useState(true);
+  const [checkingNas, setCheckingNas] = useState(false);
   const [error, setError] = useState("");
   const [page, setPage] = useState("关注动态");
-  const [category, setCategory] = useState<Category>("全部");
   const [query, setQuery] = useState("");
   const [saved, setSaved] = useState<number[]>([]);
   const [liked, setLiked] = useState<number[]>([]);
@@ -53,7 +55,11 @@ function App() {
     const provider = window.ethereum;
     const reset = () => {
       setSession(null);
-      setError("钱包账户或网络已变更，请重新连接。");
+      setSelected(null);
+      setSaved([]);
+      setLiked([]);
+      setError("Wallet account or network changed. Please sign in again.");
+      void logoutWallet().catch(() => setError("Signed out locally. The server session could not be revoked and will remain valid until it expires."));
     };
     provider?.on?.("accountsChanged", reset);
     provider?.on?.("chainChanged", reset);
@@ -64,6 +70,18 @@ function App() {
       provider?.removeListener?.("disconnect", reset);
     };
   }, [session?.mode]);
+  useEffect(() => {
+    if (session?.mode !== "wallet") return;
+    const timer = setTimeout(() => {
+      setSession(null);
+      setSelected(null);
+      setSaved([]);
+      setLiked([]);
+      setError("Your session has expired. Please sign in again.");
+      void logoutWallet().catch(() => {});
+    }, Math.max(0, sessionExpiresAt() * 1000 - Date.now()));
+    return () => clearTimeout(timer);
+  }, [session]);
   useEffect(() => {
     if (!notice) return;
     const timer = setTimeout(() => setNotice(""), 4000);
@@ -102,16 +120,18 @@ function App() {
     setError("");
     try {
       setSession({ mode: "wallet", address: await connectWallet() });
+      setNasAvailable(true);
+      setPage("我的 NAS");
     } catch (e) {
       const code = (e as { code?: number }).code;
       setError(
         code === 4001
-          ? "你取消了钱包连接，可以随时重试。"
+          ? "You canceled the wallet request. You can try again at any time."
           : code === -32002
-            ? "钱包中已有待处理请求，请打开钱包完成连接。"
+            ? "A wallet request is already pending. Open your wallet to complete it."
             : e instanceof Error
               ? e.message
-              : "连接失败，请检查钱包后重试。",
+              : "Connection failed. Check your wallet and try again.",
       );
     } finally {
       setBusy(false);
@@ -119,16 +139,34 @@ function App() {
   };
   const toggleSave = (id: number) => {
     setSaved((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
-    setNotice("仅更新本次演示收藏，尚未下载到 NAS。");
+    setNotice("Demo bookmarks updated for this session only. No content was downloaded to your NAS.");
   };
   const toggleLike = (id: number) =>
     setLiked((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
   const navigate = (name: string) => {
     setPage(name);
     setQuery("");
-    setCategory("全部");
     setMobileNav(false);
   };
+  const checkNas = async (openPublishing = false) => {
+    if (session?.mode !== "wallet") {
+      setNotice("Sign in with your wallet to connect to the NAS. Demo mode has no NAS session.");
+      return;
+    }
+    setCheckingNas(true);
+    try {
+      await checkNasSession();
+      setNasAvailable(true);
+      if (openPublishing) navigate("我的发布");
+      else setNotice("NAS connection and wallet session verified.");
+    } catch {
+      setNasAvailable(false);
+      setNotice("Unable to verify the NAS session. Check that the server is running and sign in again if your session has expired.");
+    } finally {
+      setCheckingNas(false);
+    }
+  };
+  const nasConnected = session?.mode === "wallet" && nasAvailable;
   if (!session)
     return (
       <div className="login-page">
@@ -201,7 +239,7 @@ function App() {
               disabled={busy}
             >
               <Wallet size={19} />
-              {busy ? "请在钱包中确认…" : "连接钱包"}
+              {busy ? "Confirm in your wallet…" : "Connect wallet"}
               <ArrowRight size={18} />
             </button>
             {error && (
@@ -216,14 +254,15 @@ function App() {
             </div>
             <button
               className="button demo"
+              disabled={busy}
               onClick={() => setSession({ mode: "demo" })}
             >
               进入演示空间 <ArrowUpRight />
             </button>
             <p className="login-note">
-              连接仅请求公开地址，不请求转账或私钥。
+              Sign a one-time message to log in. No transfers or private keys are requested.
               <br />
-              此版本尚未接入 NAS 登录认证。
+              A running NAS node is required. Only Base Sepolia EOA wallets are supported.
             </p>
             <div className="network-label">
               <span /> Base Sepolia · 开发网络
@@ -244,7 +283,6 @@ function App() {
       (page !== "我的收藏" || saved.includes(p.id)) &&
       ((page !== "山间来信" && page !== "阿禾的日常" && page !== "字节花园") ||
         p.author === page) &&
-      (category === "全部" || p.category === category) &&
       `${p.title}${p.author}${p.description}`.includes(query),
   );
   const feedPage = !["我的 NAS", "我的发布"].includes(page);
@@ -254,7 +292,7 @@ function App() {
         <div className="header-brand">
           <button
             className="icon-button mobile-menu"
-            aria-label="打开导航"
+            aria-label="Open navigation"
             onClick={() => setMobileNav(!mobileNav)}
           >
             <Menu />
@@ -264,8 +302,8 @@ function App() {
         <form className="search" onSubmit={(e) => e.preventDefault()}>
           <Search size={19} />
           <input
-            aria-label="搜索演示内容"
-            placeholder="搜索内容、创作者…"
+            aria-label="Search demo content"
+            placeholder="Search content or creators…"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
           />
@@ -274,21 +312,20 @@ function App() {
           <span className="preview-badge">演示内容</span>
           <button
             className="button publish"
-            onClick={() =>
-              setNotice("发布功能待接入 NAS，当前不会签名或发送内容。")
-            }
+            disabled={checkingNas}
+            onClick={() => void checkNas(true)}
           >
             <Plus size={17} />
             发布内容
           </button>
           <button
             className="user-avatar"
-            title="当前身份"
+            title="Current identity"
             onClick={() =>
               setNotice(
                 session.address
-                  ? `已连接 ${session.address}；尚未完成 NAS 认证。`
-                  : "当前为演示身份，不关联真实钱包。",
+                  ? `Wallet ${session.address} authenticated with NAS ${apiBaseUrl}. On-chain binding has not been checked.`
+                  : "You are using a demo identity with no linked wallet.",
               )
             }
           >
@@ -299,12 +336,12 @@ function App() {
       {mobileNav && (
         <button
           className="nav-backdrop"
-          aria-label="关闭导航"
+          aria-label="Close navigation"
           onClick={() => setMobileNav(false)}
         />
       )}
       <aside className={`sidebar ${mobileNav ? "open" : ""}`}>
-        <nav aria-label="主导航">
+        <nav aria-label="Main navigation">
           <p className="nav-label">我的空间</p>
           {[
             { name: "关注动态", Icon: Home },
@@ -361,8 +398,8 @@ function App() {
             <div>
               <strong>你的数字家园</strong>
               <small>
-                <span className="status-dot" />
-                NAS 尚未连接
+                <span className={`status-dot ${nasConnected ? "" : "disconnected"}`} />
+                {session.mode === "demo" ? "Demo mode · No NAS session" : nasConnected ? "NAS connected" : "NAS unavailable"}
               </small>
             </div>
             <ChevronRight size={15} />
@@ -374,8 +411,9 @@ function App() {
             </span>
             <button
               className="icon-button"
-              aria-label="退出登录"
+              aria-label="Sign out"
               onClick={() => {
+                void logoutWallet().catch(() => setError("Signed out locally. The server session could not be revoked and will remain valid until it expires."));
                 setSession(null);
                 setSelected(null);
                 setSaved([]);
@@ -399,6 +437,7 @@ function App() {
           我的空间 <ChevronRight size={13} />
           <span>{page}</span>
         </div>
+        {session.mode === "wallet" && session.address && <React.Suspense fallback={<p role="status">Checking profile registration…</p>}><NasBinding key={session.address} owner={session.address} /></React.Suspense>}
         <div className="page-heading">
           <div>
             <h1>{page === "关注动态" ? "每一份分享，都值得停留。" : page}</h1>
@@ -406,7 +445,7 @@ function App() {
               {page === "关注动态"
                 ? "来自你关注的人，按时间自然发生。"
                 : page === "我的收藏"
-                  ? "留住想要再次回看的片刻。本次收藏仅在当前页面有效。"
+                  ? "Save moments to revisit. Bookmarks are kept for this session only."
                   : page === "我的 NAS"
                     ? "连接自己的设备，让数据回到自己的手中。"
                     : "你的选择，构成你的内容世界。"}
@@ -435,21 +474,24 @@ function App() {
         ) : page === "我的 NAS" ? (
           <section className="empty-state">
             <Server size={42} />
-            <h2>还没有连接常驻 NAS</h2>
-            <p>
-              钱包连接不代表已完成设备绑定。注册合约和节点接口接入后，你可以在这里管理自己的数字家园。
-            </p>
-            <span className="network-label">
-              Base Sepolia · 尚未查询链上绑定
-            </span>
+            <h2>{nasConnected ? "NAS connected" : session.mode === "demo" ? "Demo mode" : "NAS unavailable"}</h2>
+            <p>{session.mode === "wallet"
+              ? `NAS API: ${apiBaseUrl}. ${nasConnected ? "Your wallet has authenticated with this NAS." : "Check the server connection and verify your session again."}`
+              : "Sign in with your wallet to use the configured NAS. Demo mode does not connect to the server."}</p>
+            {session.mode === "wallet" && (
+              <button className="button demo" disabled={checkingNas} onClick={() => void checkNas()}>
+                {checkingNas ? "Checking NAS…" : "Check NAS connection"}
+              </button>
+            )}
+
           </section>
         ) : page === "我的发布" ? (
           <section className="empty-state">
             <Leaf size={42} />
-            <h2>你的故事，从这里开始</h2>
-            <p>
-              发布功能尚未接入。未来内容将先保存在自己的 NAS，再向网络传播。
-            </p>
+            <h2>{nasConnected ? "NAS connected · Publishing pending" : "Publishing is not available yet"}</h2>
+            <p>{nasConnected
+              ? "You are authenticated with your NAS. The content publishing and file upload APIs are not implemented yet."
+              : "Sign in with your wallet and verify the NAS connection. Content publishing and file uploads are not implemented yet."}</p>
             <button
               className="button demo"
               onClick={() => navigate("关注动态")}
@@ -484,19 +526,7 @@ function App() {
             {feedPage && (
               <>
                 <div className="feed-toolbar">
-                  <div className="tabs" aria-label="内容类别">
-                    {(
-                      ["全部", "影像", "生活", "技术", "自然"] as Category[]
-                    ).map((c) => (
-                      <button
-                        key={c}
-                        className={category === c ? "selected" : ""}
-                        onClick={() => setCategory(c)}
-                      >
-                        {c}
-                      </button>
-                    ))}
-                  </div>
+                  <span>{page === "关注动态" ? "关注内容" : "时间线"}</span>
                   <span className="sort-label">
                     最新发布 <ArrowDown size={14} />
                   </span>
@@ -511,20 +541,22 @@ function App() {
                   </span>
                   <small>{visible.length} 份演示内容</small>
                 </div>
-                <section className="post-grid">
+                <section
+                  className={page === "关注动态" ? "post-grid" : "post-timeline"}
+                  aria-label={page === "关注动态" ? "关注内容卡片" : "内容时间线"}
+                >
                   {visible.map((post) => (
                     <article className="post-card" key={post.id}>
                       <button
                         className="thumbnail"
                         onClick={() => setSelected(post)}
-                        aria-label={`阅读：${post.title}`}
+                        aria-label={`Read: ${post.title}`}
                       >
                         <img
                           src={photo(post.image)}
                           alt={post.title}
                           loading="lazy"
                         />
-                        <span className="category-badge">{post.category}</span>
                         {post.duration && (
                           <span className="duration">{post.duration}</span>
                         )}
@@ -537,7 +569,7 @@ function App() {
                           className="avatar"
                           style={{ background: post.color }}
                           onClick={() => navigate(post.author)}
-                          aria-label={`查看${post.author}`}
+                          aria-label={`View ${post.author}`}
                         >
                           {post.avatar}
                         </button>
@@ -565,8 +597,8 @@ function App() {
                           className={`icon-button save ${saved.includes(post.id) ? "is-saved" : ""}`}
                           aria-label={
                             saved.includes(post.id)
-                              ? "取消演示收藏"
-                              : "收藏演示内容"
+                              ? "Remove demo bookmark"
+                              : "Bookmark demo content"
                           }
                           onClick={() => toggleSave(post.id)}
                         >
@@ -586,13 +618,13 @@ function App() {
                     <Compass size={36} />
                     <h2>
                       {page === "我的收藏"
-                        ? "还没有收藏内容"
-                        : "没有找到相关内容"}
+                        ? "No bookmarks yet"
+                        : "No matching content found"}
                     </h2>
                     <p>
                       {page === "我的收藏"
-                        ? "点击内容卡片的书签，收藏喜欢的演示内容。"
-                        : "试试其他关键词或内容类别。"}
+                        ? "Select the bookmark on a content card to save demo content."
+                        : "Try a different search term."}
                     </p>
                   </section>
                 )}
@@ -624,21 +656,21 @@ function App() {
             <button
               autoFocus
               className="modal-close icon-button"
-              aria-label="关闭内容"
+              aria-label="Close content"
               onClick={() => setSelected(null)}
             >
               <X />
             </button>
             <img src={photo(selected.image, 1200)} alt={selected.title} />
             <div className="modal-body">
-              <span className="eyebrow">{selected.category} · 演示内容</span>
+              <span className="eyebrow">演示内容</span>
               <h2 id="post-dialog-title">{selected.title}</h2>
               <p className="modal-author">
                 {selected.author} · {selected.time}
               </p>
               <p>{selected.description}</p>
               <p className="muted">
-                这是内容展示原型，尚无实际视频播放或 NAS 文件传输。
+                This is a content display prototype. Video playback and NAS file transfers are not available yet.
               </p>
               <div className="modal-actions">
                 <button
@@ -649,7 +681,7 @@ function App() {
                     size={17}
                     fill={liked.includes(selected.id) ? "currentColor" : "none"}
                   />
-                  {liked.includes(selected.id) ? "已点赞" : "点赞"} ·{" "}
+                  {liked.includes(selected.id) ? "Liked" : "Like"} ·{" "}
                   {selected.likes + (liked.includes(selected.id) ? 1 : 0)}
                 </button>
                 <button
@@ -657,7 +689,7 @@ function App() {
                   onClick={() => toggleSave(selected.id)}
                 >
                   <Bookmark size={17} />
-                  {saved.includes(selected.id) ? "已收藏" : "收藏"}
+                  {saved.includes(selected.id) ? "Bookmarked" : "Bookmark"}
                 </button>
               </div>
             </div>

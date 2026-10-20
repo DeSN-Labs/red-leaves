@@ -1,11 +1,10 @@
-export type Category = "全部" | "影像" | "生活" | "技术" | "自然";
 export interface Post {
   id: number;
   title: string;
   author: string;
   avatar: string;
   color: string;
-  category: Category;
+  publishedAt: string;
   image: string;
   time: string;
   duration?: string;
@@ -19,7 +18,7 @@ export const posts: Post[] = [
     author: "山间来信",
     avatar: "山",
     color: "#758c73",
-    category: "自然",
+    publishedAt: "2026-10-19T08:00:00+08:00",
     image: "photo-1441974231531-c6227db76b6e",
     time: "2 小时前",
     duration: "08:24",
@@ -33,7 +32,7 @@ export const posts: Post[] = [
     author: "阿禾的日常",
     avatar: "禾",
     color: "#bc8e69",
-    category: "生活",
+    publishedAt: "2026-10-19T06:00:00+08:00",
     image: "photo-1449247709967-d4461a6a6103",
     time: "4 小时前",
     duration: "12:06",
@@ -47,7 +46,7 @@ export const posts: Post[] = [
     author: "字节花园",
     avatar: "字",
     color: "#71899b",
-    category: "技术",
+    publishedAt: "2026-10-19T05:00:00+08:00",
     image: "photo-1498050108023-c5249f4df085",
     time: "5 小时前",
     duration: "16:32",
@@ -61,7 +60,7 @@ export const posts: Post[] = [
     author: "不赶路的人",
     avatar: "路",
     color: "#71999d",
-    category: "影像",
+    publishedAt: "2026-10-18T18:00:00+08:00",
     image: "photo-1475924156734-496f6cac6ec1",
     time: "昨天",
     duration: "06:18",
@@ -74,7 +73,7 @@ export const posts: Post[] = [
     author: "阿禾的日常",
     avatar: "禾",
     color: "#bc8e69",
-    category: "生活",
+    publishedAt: "2026-10-18T12:00:00+08:00",
     image: "photo-1490645935967-10de6ba17061",
     time: "昨天",
     description:
@@ -87,7 +86,7 @@ export const posts: Post[] = [
     author: "山间来信",
     avatar: "山",
     color: "#758c73",
-    category: "自然",
+    publishedAt: "2026-10-18T09:00:00+08:00",
     image: "photo-1416879595882-3373a0480b5b",
     time: "昨天",
     duration: "05:42",

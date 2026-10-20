@@ -7,19 +7,22 @@
     "node": ">=22.12.0"
   },
   "scripts": {
-    "dev": "vite --host 127.0.0.1",
-    "build": "tsc --noEmit && vite build",
+    "dev": "vite --mode profile --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build --mode profile",
     "check": "tsc --noEmit",
-    "preview": "vite preview --host 127.0.0.1"
+    "preview": "vite preview --mode profile --host 127.0.0.1",
+    "test": "node --experimental-strip-types --test tests/*.test.mjs"
   },
   "dependencies": {
+    "lucide-react": "^0.468.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
-    "lucide-react": "^0.468.0"
+    "viem": "^2.57.7"
   },
   "devDependencies": {
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
+    "fake-indexeddb": "^6.2.6",
     "typescript": "^5.9.3",
     "vite": "^7.2.2"
   }
