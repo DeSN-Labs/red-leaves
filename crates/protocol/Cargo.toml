@@ -3,3 +3,20 @@ name = "red-leaves-protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+prost.workspace = true
+ciborium.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+sha2.workspace = true
+sha3.workspace = true
+k256.workspace = true
+thiserror.workspace = true
+libp2p-core.workspace = true
+libp2p-identity.workspace = true
+multiaddr.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+serde_json = "1"

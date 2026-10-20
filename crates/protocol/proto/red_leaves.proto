@@ -1,0 +1,189 @@
+// Wire version 1. Mirrors src/wire.rs; field numbers must stay aligned.
+syntax = "proto3";
+package red_leaves.v1;
+
+message Frame {
+  uint32 version = 1;
+  Scope scope = 2;
+  bytes session_id = 3;
+  bytes context_id = 4;
+  bytes request_id = 5;
+  oneof payload {
+    Hello hello = 10;
+    Hello hello_ack = 11;
+    OpenUserContext open_user_context = 12;
+    ContextAccepted context_accepted = 13;
+    EventOffer event_offer = 14;
+    EventRef event_want = 15;
+    EventReject event_reject = 16;
+    SignedEvent event_data = 17;
+    SignedReceipt event_committed = 18;
+    SyncSummary sync_summary = 19;
+    SyncRequest sync_request = 20;
+    SyncBatch sync_batch = 21;
+    EventRef object_get = 22;
+    ObjectData object_data = 23;
+    ChunkGet chunk_get = 24;
+    ChunkData chunk_data = 25;
+    Cancel cancel = 26;
+    bytes ping = 27;
+    Status status = 28;
+    bytes pong = 29;
+  }
+}
+
+message Scope {
+  string protocol_family = 1;
+  uint32 network_version = 2;
+  uint64 chain_id = 3;
+  bytes registry_contract = 4;
+}
+
+message Hello {
+  NodeRole node_role = 1;
+  repeated uint32 supported_versions = 2;
+  repeated Capability capabilities = 3;
+  bytes nonce = 4;
+  uint32 max_control_frame = 5;
+  uint32 max_object_frame = 6;
+  uint32 max_chunk_payload = 7;
+  uint32 max_concurrent_streams = 8;
+}
+
+message OpenUserContext {
+  bytes acting_owner = 1;
+  bytes target_owner = 2;
+  bytes grant = 3;
+  repeated string requested_capabilities = 4;
+  bytes proof_signature = 5;
+}
+
+message ContextAccepted {
+  repeated string granted_capabilities = 1;
+}
+
+message EventOffer {
+  bytes event_id = 1;
+  bytes actor_owner = 2;
+  EventKind event_kind = 3;
+  uint32 encoded_size = 4;
+}
+
+message EventRef {
+  bytes id = 1;
+}
+
+message EventReject {
+  bytes event_id = 1;
+  ErrorCode code = 2;
+}
+
+message SignedEvent {
+  bytes canonical_payload = 1;
+  SignatureAlgorithm signature_algorithm = 2;
+  bytes signature = 3;
+}
+
+message SignedReceipt {
+  bytes envelope = 1;
+}
+
+message SyncSummary {
+  bytes stream_id = 1;
+  uint64 high_water = 2;
+}
+
+message SyncRequest {
+  bytes stream_id = 1;
+  uint64 after_cursor = 2;
+  uint32 limit = 3;
+}
+
+message SyncBatch {
+  bytes stream_id = 1;
+  repeated bytes event_ids = 2;
+  uint64 next_cursor = 3;
+  bool has_more = 4;
+}
+
+message ObjectData {
+  bytes id = 1;
+  bytes data = 2;
+}
+
+message ChunkGet {
+  bytes object_id = 1;
+  uint32 index = 2;
+  uint32 byte_credit = 3;
+}
+
+message ChunkData {
+  bytes object_id = 1;
+  uint32 index = 2;
+  bytes data = 3;
+  bytes chunk_id = 4;
+}
+
+message Cancel {
+  bytes request_id = 1;
+}
+
+message Status {
+  ErrorCode code = 1;
+  string message = 2;
+  optional uint32 retry_after_seconds = 3;
+}
+
+enum NodeRole {
+  NODE_ROLE_UNSPECIFIED = 0;
+  NODE_ROLE_NAS = 1;
+  NODE_ROLE_RELAY = 2;
+  NODE_ROLE_DISCOVERY = 3;
+}
+
+enum Capability {
+  CAPABILITY_UNSPECIFIED = 0;
+  CAPABILITY_PUBLIC_EVENTS = 1;
+  CAPABILITY_SYNC = 2;
+  CAPABILITY_OBJECTS = 3;
+  CAPABILITY_CHUNKS = 4;
+}
+
+enum EventKind {
+  EVENT_KIND_UNSPECIFIED = 0;
+  EVENT_KIND_POST = 1;
+  EVENT_KIND_FOLLOW = 2;
+  EVENT_KIND_LIKE = 3;
+}
+
+enum SignatureAlgorithm {
+  SIGNATURE_ALGORITHM_UNSPECIFIED = 0;
+  SIGNATURE_ALGORITHM_EOA_EIP712 = 1;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_UNSUPPORTED_VERSION = 1;
+  ERROR_CODE_UNSUPPORTED_CAPABILITY = 2;
+  ERROR_CODE_NETWORK_MISMATCH = 3;
+  ERROR_CODE_INVALID_MESSAGE = 4;
+  ERROR_CODE_INVALID_SIGNATURE = 5;
+  ERROR_CODE_REPLAY_DETECTED = 6;
+  ERROR_CODE_AUTH_REQUIRED = 7;
+  ERROR_CODE_AUTH_EXPIRED = 8;
+  ERROR_CODE_AUTH_REVOKED = 9;
+  ERROR_CODE_USER_NOT_REGISTERED = 10;
+  ERROR_CODE_BINDING_MISMATCH = 11;
+  ERROR_CODE_CHAIN_UNAVAILABLE = 12;
+  ERROR_CODE_NOT_FOUND_OR_FORBIDDEN = 13;
+  ERROR_CODE_REJECTED_BY_POLICY = 14;
+  ERROR_CODE_RESOURCE_EXHAUSTED = 15;
+  ERROR_CODE_NO_ROUTE = 16;
+  ERROR_CODE_RELAY_UNAVAILABLE = 17;
+  ERROR_CODE_RELAY_LIMIT_REACHED = 18;
+  ERROR_CODE_RELAY_PAYMENT_UNSUPPORTED = 19;
+  ERROR_CODE_DEADLINE_EXCEEDED = 20;
+  ERROR_CODE_STORAGE_UNAVAILABLE = 21;
+  ERROR_CODE_SYNC_GAP = 22;
+  ERROR_CODE_INTEGRITY_FAILED = 23;
+}

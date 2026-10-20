@@ -22,3 +22,12 @@ hex = "0.4"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tower-http = { version = "0.6", features = ["cors"] }
 dotenvy = "0.15"
+prost = "0.14"
+ciborium = "0.2"
+serde_bytes = "0.11"
+thiserror = "2"
+libp2p-core = "0.43.2"
+libp2p-identity = { version = "0.2.14", features = ["ed25519", "peerid", "rand"] }
+multiaddr = "0.18"
+k256 = { version = "0.13", features = ["ecdsa"] }
+sha3 = "0.10"

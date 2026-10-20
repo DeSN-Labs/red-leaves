@@ -85,3 +85,5 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 Cargo features 为叠加关系，同时启用将包含两种数据库驱动。`nas` 已实现 SQLite 钱包认证；`relay` 目前仅引入 PostgreSQL 依赖，中继存储与服务尚未实现。同时启用时运行 NAS 实现。
 
 身份注册设计已确认：链上用户信息仅保存钱包地址、对应常驻 NAS 的 PeerId、内容加密公钥和昵称；头像（含地址、内容标识及哈希）、性别及其他资料通过链下网络获取，私钥不上链。中继入口与服务授权改为链下设计，发现、防重放、公钥轮换与恢复规则待定；注册合约及 Web 首次登记已实现，部署及接口见 [合约说明](contracts/README.md)。详见[数据交换协议](docs/data-exchange-protocol.md)。
+
+NAS 与中继参与的通信方案见[节点通信协议 v0.1 草案](docs/node-communication-protocol-v0.1.md)。[共享协议库](crates/protocol/README.md)已实现有界 Protobuf 帧、确定性 CBOR、握手协商、签名中继路由、EOA 公开事件验签、签名保存声明及文件清单／块完整性检查，并提供参考向量和内存交换测试。实际 P2P／中继发现、授权及撤销执行、持久化投递队列、NAS 解密私钥保管和私密内容加密尚未实现。
