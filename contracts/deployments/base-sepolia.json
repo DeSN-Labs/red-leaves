@@ -1,0 +1,12 @@
+{
+  "chainId": 84532,
+  "contractName": "UserRegistry",
+  "contractAddress": "0x8bace138a9a08009451001f62624960c581c5954",
+  "deploymentTransactionHash": "0x5769d77f3cef7582bd76a9fa8d06d169ad4a794a7c2fd65d85d4bdc7a570f3ce",
+  "blockNumber": 48319667,
+  "deployer": "0x5cf2866315baf66022b95d3b1fedb5a1c85e509b",
+  "compilerVersion": "0.8.28",
+  "sourceSha256": "4e45d04b4c0d7c442c3c70d7ce691f06282e39aa334bd6993277244bbbe179f1",
+  "evidence": "Successful local Foundry broadcast receipt",
+  "independentRpcVerification": "Not completed: public RPC returned HTTP 403"
+}

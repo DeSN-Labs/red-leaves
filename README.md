@@ -199,8 +199,17 @@ cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-The node currently prints a scaffold message; networking and APIs are not implemented.
+The default NAS node runs an EOA wallet authentication API backed by SQLite; NAS PeerId persistence and explicit Web registration are implemented; P2P networking and content APIs are not implemented. See [NAS registration](docs/nas-registration.md) and [wallet login](docs/wallet-login.md) for configuration and API details.
 For the React + TypeScript + Vite Web prototype, use Node.js 22.12+, run `npm ci` and `npm run dev` in `web/`;
 `npm run build` produces static files. Run `forge build` and `forge test` in
-`contracts/` with Foundry installed; there are no contracts or contract tests yet.
+`contracts/` with Foundry installed. The user registry contract and tests are implemented; the [deployment record](contracts/deployments/base-sepolia.json) states the local receipt evidence and RPC verification limit; configure `contracts/.env.profile` using `.env.example` before running the [deployment script](contracts/README.md).
 See component READMEs for boundaries and commands.
+
+Database dependencies use SQLx, selected by node features:
+
+- `nas` (default): SQLite; build with `cargo build -p red-leaves`.
+- `relay`: PostgreSQL with rustls; build with `cargo build -p red-leaves --no-default-features --features relay`.
+
+Cargo features are additive: enabling both includes both drivers. The NAS feature implements SQLite-backed wallet authentication. The relay feature currently selects PostgreSQL dependencies only; relay storage and services are not implemented. Enabling both runs the NAS implementation.
+
+The identity registry design stores only the wallet address, associated NAS PeerId, content encryption public key, and nickname on-chain. Avatars (including their references and hashes), gender, and other profile information are fetched off-chain; private keys stay off-chain. Relay discovery and service authorization now require an off-chain design; replay protection, key rotation, and recovery remain pending. The contract and first-registration UI are implemented; see the [contract guide](contracts/README.md). See the [data exchange protocol](docs/data-exchange-protocol.md).

@@ -72,7 +72,16 @@ cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-当前节点仅输出骨架提示，不运行服务。Web 使用 Node.js 22.12+，执行
+默认 NAS 节点已运行 SQLite 支持的 EOA 钱包认证 API；支持持久 NAS PeerId 和 Web 首次链上登记；P2P 网络与内容 API 尚未实现。绑定流程见[首次绑定 NAS](docs/nas-registration.md)。配置及接口见[钱包登录](docs/wallet-login.md)。Web 使用 Node.js 22.12+，执行
 `cd web`、`npm ci`、`npm run dev`；构建使用 `npm run build`。
 合约工程使用 Foundry，执行 `cd contracts` 后运行 `forge build` 和 `forge test`；
-当前尚无合约及合约测试。详见各目录 README。
+已实现用户注册合约和测试，部署配置见 `contracts/.env.example`，本地填写 `contracts/.env.profile` 后执行部署脚本；已有本地成功广播回执，独立 RPC 复核状态见 [部署记录](contracts/deployments/base-sepolia.json)。详见各目录 README。
+
+数据库依赖统一使用 SQLx，通过节点 features 选择：
+
+- `nas`（默认）：SQLite，使用 `cargo build -p red-leaves` 构建。
+- `relay`：PostgreSQL 与 rustls，使用 `cargo build -p red-leaves --no-default-features --features relay` 构建。
+
+Cargo features 为叠加关系，同时启用将包含两种数据库驱动。`nas` 已实现 SQLite 钱包认证；`relay` 目前仅引入 PostgreSQL 依赖，中继存储与服务尚未实现。同时启用时运行 NAS 实现。
+
+身份注册设计已确认：链上用户信息仅保存钱包地址、对应常驻 NAS 的 PeerId、内容加密公钥和昵称；头像（含地址、内容标识及哈希）、性别及其他资料通过链下网络获取，私钥不上链。中继入口与服务授权改为链下设计，发现、防重放、公钥轮换与恢复规则待定；注册合约及 Web 首次登记已实现，部署及接口见 [合约说明](contracts/README.md)。详见[数据交换协议](docs/data-exchange-protocol.md)。
