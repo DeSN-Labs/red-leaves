@@ -1,4 +1,4 @@
-//! NAS authentication API shared by Web and native clients.
+//! NAS authentication and content API shared by Web and native clients.
 use crate::identity::{self, CHAIN_ID, CHALLENGE_SECONDS, SESSION_SECONDS};
 use axum::{
     Json, Router,
@@ -15,9 +15,22 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+mod posts;
+
+pub fn start_delivery(
+    pool: SqlitePool,
+    config: Config,
+    network: Option<(
+        crate::network::transport::Handle,
+        tokio::sync::mpsc::Receiver<crate::network::transport::Incoming>,
+    )>,
+) -> tokio::task::JoinHandle<()> {
+    posts::delivery::start(app_state(pool, config), network)
+}
 
 #[derive(Clone)]
 pub struct Config {
+    pub posts: Option<Arc<crate::posts::Service>>,
     pub listen: String,
     pub domain: String,
     pub uri: String,
@@ -47,6 +60,7 @@ impl Config {
             return Err("Authentication URI must not contain credentials".into());
         }
         Ok(Self {
+            posts: Some(crate::posts::Service::from_env()?),
             listen: std::env::var("RED_LEAVES_LISTEN").unwrap_or_else(|_| "127.0.0.1:3000".into()),
             domain,
             uri,
@@ -77,11 +91,8 @@ struct ErrorBody {
 }
 impl From<sqlx::Error> for ApiError {
     fn from(_: sqlx::Error) -> Self {
-        eprintln!("Authentication database operation failed");
-        Self(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Authentication storage unavailable",
-        )
+        tracing::error!("NAS database operation failed");
+        Self(StatusCode::SERVICE_UNAVAILABLE, "NAS storage unavailable")
     }
 }
 fn invalid() -> ApiError {
@@ -104,18 +115,14 @@ fn valid_secret(value: &str) -> bool {
 }
 
 pub fn router(pool: SqlitePool, config: Config) -> Router {
-    let state = AppState {
-        pool,
-        config,
-        rate: Arc::default(),
-        permits: Arc::new(tokio::sync::Semaphore::new(16)),
-    };
+    let state = app_state(pool, config);
     Router::new()
         .route("/api/auth/challenge", post(challenge))
         .route("/api/auth/verify", post(verify))
         .route("/api/auth/me", get(me))
         .route("/api/nas/info", get(nas_info))
         .route("/api/auth/logout", post(logout))
+        .merge(posts::routes())
         .layer(DefaultBodyLimit::max(4096))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .layer(
@@ -126,7 +133,55 @@ pub fn router(pool: SqlitePool, config: Config) -> Router {
         )
         .with_state(state)
 }
+fn app_state(pool: SqlitePool, config: Config) -> AppState {
+    AppState {
+        pool,
+        config,
+        rate: Arc::default(),
+        permits: Arc::new(tokio::sync::Semaphore::new(16)),
+    }
+}
 async fn guard(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    use tracing::Instrument;
+    static REQUEST_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let request_id = REQUEST_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let method = match request.method().as_str() {
+        "GET" => "GET",
+        "POST" => "POST",
+        "PUT" => "PUT",
+        "PATCH" => "PATCH",
+        "DELETE" => "DELETE",
+        "HEAD" => "HEAD",
+        "OPTIONS" => "OPTIONS",
+        _ => "OTHER",
+    };
+    let route = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|path| path.as_str())
+        .unwrap_or("unmatched")
+        .to_owned();
+    let span = tracing::info_span!("http_request", request_id, method, route);
+    async move {
+        let start = Instant::now();
+        tracing::debug!("HTTP request received");
+        let response = guard_response(state, request, next).await;
+        let status = response.status().as_u16();
+        let headers_ms = start.elapsed().as_millis() as u64;
+        if response.status().is_server_error() {
+            tracing::error!(status, headers_ms, "HTTP request completed");
+        } else {
+            tracing::info!(status, headers_ms, "HTTP request completed");
+        }
+        response
+    }
+    .instrument(span)
+    .await
+}
+async fn guard_response(state: AppState, request: Request, next: Next) -> Response {
+    let content_request = ["/api/posts", "/api/social/", "/api/content/", "/api/media"]
+        .iter()
+        .any(|prefix| request.uri().path().starts_with(prefix));
     let allowed = if let Ok(mut rate) = state.rate.lock() {
         let current = Instant::now();
         while rate
@@ -152,7 +207,12 @@ async fn guard(State(state): State<AppState>, request: Request, next: Next) -> R
         )
         .into_response()
     } else {
-        match tokio::time::timeout(Duration::from_secs(10), next.run(request)).await {
+        match tokio::time::timeout(
+            Duration::from_secs(if content_request { 60 } else { 10 }),
+            next.run(request),
+        )
+        .await
+        {
             Ok(response) => response,
             Err(_) => ApiError(
                 StatusCode::REQUEST_TIMEOUT,
@@ -273,6 +333,10 @@ async fn verify(
             "Too many active sessions",
         ));
     }
+    sqlx::query("INSERT OR IGNORE INTO social_accounts(owner) VALUES(?)")
+        .bind(&address)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(Json(SessionResponse {
         token,
@@ -315,16 +379,37 @@ struct NasInfo {
     node_type: &'static str,
     peer_id: String,
     p2p_running: bool,
+    p2p_peers: usize,
+    p2p_addresses: Vec<String>,
 }
 async fn nas_info(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<NasInfo>, ApiError> {
     let _ = me(State(state.clone()), headers).await?;
+    let net = state
+        .config
+        .posts
+        .as_ref()
+        .and_then(|s| s.runtime.network());
     Ok(Json(NasInfo {
+        p2p_peers: net.as_ref().map_or(0, |h| {
+            h.status
+                .connected
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }),
+        p2p_addresses: net
+            .as_ref()
+            .and_then(|h| h.status.listeners.lock().ok().map(|v| v.clone()))
+            .unwrap_or_default(),
         node_type: "nas",
         peer_id: state.config.peer_id,
-        p2p_running: false,
+        p2p_running: state
+            .config
+            .posts
+            .as_ref()
+            .and_then(|s| s.runtime.network())
+            .is_some_and(|h| h.status.running.load(std::sync::atomic::Ordering::Relaxed)),
     }))
 }
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
@@ -341,6 +426,10 @@ pub async fn cleanup(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         .execute(&mut *tx)
         .await?;
     sqlx::query("DELETE FROM auth_sessions WHERE expires_at <= ?")
+        .bind(now())
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM social_challenges WHERE expires_at <= ?")
         .bind(now())
         .execute(&mut *tx)
         .await?;

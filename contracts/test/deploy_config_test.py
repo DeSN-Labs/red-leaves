@@ -8,7 +8,7 @@ import unittest
 
 
 class DeploymentConfigTest(unittest.TestCase):
-    def run_script(self, key, rpc="http://127.0.0.1:8545", broadcast=False):
+    def run_script(self, key, rpc="http://127.0.0.1:8545", broadcast=False, post_access=False):
         with tempfile.TemporaryDirectory(prefix="red-leaves-config-test-") as directory:
             root = Path(directory)
             (root / "script").mkdir()
@@ -21,15 +21,15 @@ class DeploymentConfigTest(unittest.TestCase):
             mock.write_text(
                 '#!/usr/bin/env python3\nimport os, sys\n'
                 'assert os.environ["DEPLOYER_PRIVATE_KEY"] == "0x" + "0" * 63 + "1"\n'
-                'assert sys.argv[1:5] == ["script", "script/DeployUserRegistry.s.sol:DeployUserRegistry", "--rpc-url", "base_sepolia"]\n'
+                'assert sys.argv[1:5] == ["script", os.environ["EXPECT_SCRIPT"], "--rpc-url", "base_sepolia"]\n'
                 'assert sys.argv[5:] == (["--broadcast"] if os.environ["EXPECT_BROADCAST"] == "1" else [])\n'
                 'print("Mock deployment invoked")\n'
             )
             mock.chmod(0o700)
             environment = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
-                           "EXPECT_BROADCAST": "1" if broadcast else "0"}
+                           "EXPECT_BROADCAST": "1" if broadcast else "0", "EXPECT_SCRIPT": "script/DeployPostAccess.s.sol:DeployPostAccess" if post_access else "script/DeployUserRegistry.s.sol:DeployUserRegistry"}
             return subprocess.run(
-                ["bash", str(root / "script/deploy.sh"), *(["--broadcast"] if broadcast else [])],
+                ["bash", str(root / "script/deploy.sh"), *(["--post-access"] if post_access else []), *(["--broadcast"] if broadcast else [])],
                 env=environment, capture_output=True, text=True, check=False,
             )
 
@@ -40,6 +40,10 @@ class DeploymentConfigTest(unittest.TestCase):
                     result = self.run_script(prefix + "0" * 63 + "1", broadcast=broadcast)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn("Mock deployment invoked", result.stdout)
+
+    def test_post_access_script_is_selected_explicitly(self):
+        result = self.run_script("0" * 63 + "1", broadcast=True, post_access=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_invalid_or_missing_keys_are_rejected(self):
         for key in ("", "a" * 63, "g" * 64, "0x" + "a" * 65):

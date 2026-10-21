@@ -1,6 +1,13 @@
-//! Persistent NAS identity. P2P transport and delivery are not started yet.
+//! Persistent node identity and bounded libp2p application transport.
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
+#[cfg(any(feature = "nas", feature = "relay"))]
+pub mod transport;
 #[cfg(feature = "nas")]
-pub fn load_or_create_peer_id(path: &std::path::Path) -> Result<String, crate::identity::Error> {
+pub fn load_or_create_peer_id(path: &std::path::Path) -> Result<String, Error> {
+    Ok(load_or_create_key(path)?.public().to_peer_id().to_string())
+}
+#[cfg(any(feature = "nas", feature = "relay"))]
+pub fn load_or_create_key(path: &std::path::Path) -> Result<libp2p::identity::Keypair, Error> {
     use libp2p::identity::Keypair;
     use std::{
         fs::{self, OpenOptions},
@@ -8,10 +15,7 @@ pub fn load_or_create_peer_id(path: &std::path::Path) -> Result<String, crate::i
     };
     match fs::read(path) {
         Ok(bytes) => {
-            return Ok(Keypair::from_protobuf_encoding(&bytes)?
-                .public()
-                .to_peer_id()
-                .to_string());
+            return Ok(Keypair::from_protobuf_encoding(&bytes)?);
         }
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
@@ -43,13 +47,10 @@ pub fn load_or_create_peer_id(path: &std::path::Path) -> Result<String, crate::i
             {
                 fs::File::open(parent)?.sync_all()?;
             }
-            Ok(key.public().to_peer_id().to_string())
+            Ok(key)
         }
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-            Ok(Keypair::from_protobuf_encoding(&fs::read(path)?)?
-                .public()
-                .to_peer_id()
-                .to_string())
+            Ok(Keypair::from_protobuf_encoding(&fs::read(path)?)?)
         }
         Err(error) => Err(error.into()),
     }

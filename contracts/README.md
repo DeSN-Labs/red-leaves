@@ -82,3 +82,11 @@ NAS 后续需要配置所用链与该合约地址，不能仅靠合约名称确�
 
 保存用户信息的合约地址（UserRegistry.sol）：
 Base Sepolia 10-19 19:00: 0x8bace138A9A08009451001F62624960c581c5954
+
+## 文本付费解锁合约
+
+`src/PostAccess.sol` 是独立的 Base Sepolia 测试 ETH 付费原型。作者以 `(author, postId)` 登记固定价格及加密给自己 NAS 的内容密钥，买家通过 `buyPost(author, postId)` 付款，资金直接发送给作者，重复购买或错误金额被拒绝。任何链上存储都公开；不能把明文密钥或提前加密给未付款买家的密钥放入合约。
+
+使用同一 `.env.profile` 配置，先执行 `bash script/deploy.sh --post-access` 模拟，审核后自行执行 `bash script/deploy.sh --post-access --broadcast`。默认不带该参数仍部署 UserRegistry；不会覆盖已有用户注册合约。将新地址填写到 NAS 根配置的 `RED_LEAVES_POST_ACCESS_ADDRESS`。
+
+付款后由作者 NAS 核对链状态并向买家交付密钥，合约不承担解密或自动重新加密，不保证离线时交付。实现阶段未向测试网广播该合约；测试覆盖购买隔离、不可覆盖价格、重复购买、错误金额及作者收款失败回滚。完整流程和边界见[发帖说明](../docs/posting.md)。

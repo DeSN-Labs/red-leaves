@@ -12,7 +12,7 @@ red-leaves（红叶）旨在将互联网上的 NAS 及其他设备连接成去�
 - `README.md`：英文项目介绍与技术设计。
 - `docs/data-exchange-protocol.md`：数据交换、路由和消息接口草案。
 - `Cargo.toml`：Rust workspace，包版本为 `0.1.0`，使用 Rust 2024 edition，共享 libp2p `0.56.0` 依赖。
-- `crates/node/src/main.rs`：NAS 认证 API 与持久节点身份入口，P2P 网络与内容 API 尚未实现。
+- `crates/node/src/main.rs`：NAS 认证、图文／视频发帖、范围推送及持久节点身份入口；直连／配置中继和离线重试已实现，运行边界见 `docs/scoped-delivery.md`。
 - `crates/protocol/`：共享消息、编解码、握手、签名及完整性校验原型；接入边界见该目录 README，不启动实际 P2P 网络。
 - `web/`、`contracts/`：独立的 Web 和合约工程。
 - `tools/`： 存放工具类文件。
@@ -45,6 +45,7 @@ red-leaves（红叶）旨在将互联网上的 NAS 及其他设备连接成去�
 6. 实质性功能或协议变更同步更新相关文档，并在 `CHANGELOG.md` 的未发布部分记录；中英文介绍变更时检查两者是否一致。
 7. 不将计划功能、未运行的检查或未经确认的技术选型写成已完成事实。
 9. 配置信息都放到 `.env.profile` 文件，并维护好对应的 `.env.example` 文件。
+10. 代码需要添加必要的注释，如果代码本身的命名就有注释的作用，则不添加注释。
 
 ## 验证方式
 

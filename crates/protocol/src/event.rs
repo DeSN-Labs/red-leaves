@@ -86,7 +86,11 @@ impl PublicEvent {
 
     /// Digest passed to EIP-712 EOA signing; do not personal-sign this digest.
     pub fn signing_hash(&self) -> Result<[u8; 32]> {
-        Ok(typed_hash(&self.scope, &self.canonical_payload()?))
+        Ok(typed_hash(
+            &self.scope,
+            &self.canonical_payload()?,
+            EVENT_TYPE,
+        ))
     }
 
     pub fn event_id(&self) -> Result<ContentId> {
@@ -147,28 +151,11 @@ pub fn verify(event: &wire::SignedEvent, expected_scope: &NetworkScope) -> Resul
     let payload: PublicEvent = canonical::decode(&event.canonical_payload, MAX_OBJECT)?;
     payload.validate()?;
     payload.scope.ensure_matches(expected_scope)?;
-    let signature =
-        Signature::from_slice(&event.signature[..64]).map_err(|_| Error::InvalidSignature)?;
-    if signature.normalize_s().is_some() {
-        return Err(Error::InvalidSignature);
-    }
-    let recovery = match event.signature[64] {
-        0 | 27 => 0,
-        1 | 28 => 1,
-        _ => return Err(Error::InvalidSignature),
-    };
-    let recovery = RecoveryId::try_from(recovery).map_err(|_| Error::InvalidSignature)?;
-    let public = VerifyingKey::recover_from_prehash(
-        &typed_hash(&payload.scope, &event.canonical_payload),
-        &signature,
-        recovery,
-    )
-    .map_err(|_| Error::InvalidSignature)?;
-    let point = public.to_encoded_point(false);
-    let address = Keccak256::digest(&point.as_bytes()[1..]);
-    if address[12..] != payload.actor_owner.0 {
-        return Err(Error::InvalidSignature);
-    }
+    verify_eoa(
+        typed_hash(&payload.scope, &event.canonical_payload, EVENT_TYPE),
+        &event.signature,
+        payload.actor_owner,
+    )?;
     Ok(VerifiedEvent {
         payload,
         event_id: event_id(&event.canonical_payload),
@@ -182,7 +169,7 @@ fn event_id(payload: &[u8]) -> ContentId {
     ContentId::of(&bytes)
 }
 
-fn typed_hash(scope: &NetworkScope, payload: &[u8]) -> [u8; 32] {
+pub(crate) fn typed_hash(scope: &NetworkScope, payload: &[u8], type_signature: &str) -> [u8; 32] {
     let mut domain = Vec::with_capacity(160);
     domain.extend_from_slice(&Keccak256::digest(
         b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
@@ -194,11 +181,36 @@ fn typed_hash(scope: &NetworkScope, payload: &[u8]) -> [u8; 32] {
     domain.extend_from_slice(&[0; 12]);
     domain.extend_from_slice(&scope.registry_contract.0);
     let mut event = Vec::with_capacity(64);
-    event.extend_from_slice(&Keccak256::digest(EVENT_TYPE.as_bytes()));
+    event.extend_from_slice(&Keccak256::digest(type_signature.as_bytes()));
     event.extend_from_slice(&Keccak256::digest(payload));
     let mut typed = Vec::with_capacity(66);
     typed.extend_from_slice(&[0x19, 0x01]);
     typed.extend_from_slice(&Keccak256::digest(domain));
     typed.extend_from_slice(&Keccak256::digest(event));
     Keccak256::digest(typed).into()
+}
+
+pub(crate) fn verify_eoa(digest: [u8; 32], signature_bytes: &[u8], owner: Address) -> Result<()> {
+    if signature_bytes.len() != 65 {
+        return Err(Error::InvalidSignature);
+    }
+    let signature =
+        Signature::from_slice(&signature_bytes[..64]).map_err(|_| Error::InvalidSignature)?;
+    if signature.normalize_s().is_some() {
+        return Err(Error::InvalidSignature);
+    }
+    let recovery = match signature_bytes[64] {
+        0 | 27 => 0,
+        1 | 28 => 1,
+        _ => return Err(Error::InvalidSignature),
+    };
+    let recovery = RecoveryId::try_from(recovery).map_err(|_| Error::InvalidSignature)?;
+    let public = VerifyingKey::recover_from_prehash(&digest, &signature, recovery)
+        .map_err(|_| Error::InvalidSignature)?;
+    let point = public.to_encoded_point(false);
+    let address = Keccak256::digest(&point.as_bytes()[1..]);
+    if address[12..] != owner.0 {
+        return Err(Error::InvalidSignature);
+    }
+    Ok(())
 }

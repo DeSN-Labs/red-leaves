@@ -8,11 +8,84 @@ use serde_json::{Value, json};
 use sha3::{Digest, Keccak256};
 use tower::ServiceExt;
 
+#[tokio::test]
+async fn request_logs_include_status_without_private_input() {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tracing::instrument::WithSubscriber;
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+    let (app, _) = setup().await;
+    let capture = Capture(Arc::default());
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(capture.clone())
+        .with_max_level(tracing::Level::TRACE)
+        .finish();
+    async {
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/api/auth/challenge?private_query=SECRET_QUERY",
+            json!({"address":"SECRET_BODY"}),
+            Some("SECRET_TOKEN"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let request = Request::builder()
+            .uri("/unknown/SECRET_PATH?key=SECRET_QUERY")
+            .header("authorization", "Bearer SECRET_TOKEN")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+    .with_subscriber(subscriber)
+    .await;
+    let text = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        !text.contains("SECRET"),
+        "Private input reached the request log"
+    );
+    let events: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let completed: Vec<_> = events
+        .iter()
+        .filter(|event| event["fields"]["message"] == "HTTP request completed")
+        .collect();
+    assert_eq!(completed.len(), 2);
+    assert_eq!(completed[0]["fields"]["status"], 400);
+    assert_eq!(completed[0]["span"]["route"], "/api/auth/challenge");
+    assert_eq!(completed[1]["span"]["route"], "unmatched");
+    assert!(completed[0]["span"]["request_id"].is_number());
+    assert!(completed[0]["fields"]["headers_ms"].is_number());
+}
+
 async fn setup() -> (Router, SqlitePool) {
     let pool = crate::storage::open("sqlite::memory:").await.unwrap();
     let app = router(
         pool.clone(),
         Config {
+            posts: None,
             listen: "127.0.0.1:0".into(),
             domain: "localhost:5173".into(),
             uri: "http://localhost:5173".into(),
@@ -353,6 +426,7 @@ async fn sqlite_session_survives_reopen() {
     ));
     let url = format!("sqlite://{}", path.display());
     let config = Config {
+        posts: None,
         listen: "127.0.0.1:0".into(),
         domain: "localhost:5173".into(),
         uri: "http://localhost:5173".into(),
@@ -501,5 +575,5 @@ async fn nas_identity_requires_session_and_exposes_only_public_fields() {
     );
     assert_eq!(info["p2p_running"], false);
     assert_eq!(info["node_type"], "nas");
-    assert_eq!(info.as_object().unwrap().len(), 3);
+    assert_eq!(info.as_object().unwrap().len(), 5);
 }

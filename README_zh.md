@@ -59,6 +59,8 @@
 
 ## 开发与仓库结构
 
+NAS 与中继节点已支持可配置级别、文本／JSON 输出及按天轮转的文件日志，见[日志配置](docs/logging.md)。
+
 Rust workspace 包含 `crates/node`（节点）和 `crates/protocol`（协议库）；
 `web/` 为独立的测试与本地管理页面，`contracts/` 为 Foundry 合约工程。
 `tests/scenarios/` 保存后续多节点联调，`deploy/` 保存部署配置。
@@ -72,7 +74,7 @@ cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-默认 NAS 节点已运行 SQLite 支持的 EOA 钱包认证 API；支持持久 NAS PeerId 和 Web 首次链上登记；P2P 网络与内容 API 尚未实现。绑定流程见[首次绑定 NAS](docs/nas-registration.md)。配置及接口见[钱包登录](docs/wallet-login.md)。Web 使用 Node.js 22.12+，执行
+默认 NAS 节点已运行 SQLite 支持的 EOA 钱包认证 API；支持持久 NAS PeerId 和 Web 首次链上登记；已实现本地文本／图文／视频发布、定向加密、接收偏好及测试网付费解锁；已接入跨 NAS 范围投递、中继、离线重试、实时收件箱及远程媒体按需读取，节点地址配置见[推送说明](docs/scoped-delivery.md)。使用流程见[发帖说明](docs/posting.md)。绑定流程见[首次绑定 NAS](docs/nas-registration.md)。配置及接口见[钱包登录](docs/wallet-login.md)。Web 使用 Node.js 22.12+，执行
 `cd web`、`npm ci`、`npm run dev`；构建使用 `npm run build`。
 合约工程使用 Foundry，执行 `cd contracts` 后运行 `forge build` 和 `forge test`；
 已实现用户注册合约和测试，部署配置见 `contracts/.env.example`，本地填写 `contracts/.env.profile` 后执行部署脚本；已有本地成功广播回执，独立 RPC 复核状态见 [部署记录](contracts/deployments/base-sepolia.json)。详见各目录 README。
@@ -82,8 +84,8 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 - `nas`（默认）：SQLite，使用 `cargo build -p red-leaves` 构建。
 - `relay`：PostgreSQL 与 rustls，使用 `cargo build -p red-leaves --no-default-features --features relay` 构建。
 
-Cargo features 为叠加关系，同时启用将包含两种数据库驱动。`nas` 已实现 SQLite 钱包认证；`relay` 目前仅引入 PostgreSQL 依赖，中继存储与服务尚未实现。同时启用时运行 NAS 实现。
+Cargo features 为叠加关系，同时启用将包含两种数据库驱动。`nas` 已实现 SQLite 钱包认证及本地帖子元数据存储；`relay` 已提供电路中继与公开通知转发，PostgreSQL 持久化及流量计费尚未实现。同时启用时运行 NAS 实现。
 
 身份注册设计已确认：链上用户信息仅保存钱包地址、对应常驻 NAS 的 PeerId、内容加密公钥和昵称；头像（含地址、内容标识及哈希）、性别及其他资料通过链下网络获取，私钥不上链。中继入口与服务授权改为链下设计，发现、防重放、公钥轮换与恢复规则待定；注册合约及 Web 首次登记已实现，部署及接口见 [合约说明](contracts/README.md)。详见[数据交换协议](docs/data-exchange-protocol.md)。
 
-NAS 与中继参与的通信方案见[节点通信协议 v0.1 草案](docs/node-communication-protocol-v0.1.md)。[共享协议库](crates/protocol/README.md)已实现有界 Protobuf 帧、确定性 CBOR、握手协商、签名中继路由、EOA 公开事件验签、签名保存声明及文件清单／块完整性检查，并提供参考向量和内存交换测试。实际 P2P／中继发现、授权及撤销执行、持久化投递队列、NAS 解密私钥保管和私密内容加密尚未实现。
+NAS 与中继参与的通信方案见[节点通信协议 v0.1 草案](docs/node-communication-protocol-v0.1.md)。[共享协议库](crates/protocol/README.md)已实现有界 Protobuf 帧、确定性 CBOR、握手协商、签名中继路由、EOA 公开事件验签、签名保存声明及文件清单／块完整性检查，并提供参考向量和内存交换测试。NAS 本地发帖新增了签名发布确认、应用密钥保管、定向／付费加密及持久化待投递队列；队列已接入直连／配置中继的应用级投递；DHT 自动发现、服务 grant 及撤销传播仍待接入，见[推送说明](docs/scoped-delivery.md)和[发帖说明](docs/posting.md)。

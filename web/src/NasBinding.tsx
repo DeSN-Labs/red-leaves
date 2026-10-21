@@ -1,8 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import type { Hex } from "viem";
-import { browserEncryptionKey } from "./encryption-key";
 import { createRegistry, registryAddress, type Registration } from "./registry";
-import { getNasInfo, type Provider } from "./wallet";
+import { getNasInfo, nasApi, type Provider } from "./wallet";
 
 export function NasBinding({ owner }: { owner: string }) {
   const [peerId, setPeerId] = useState("");
@@ -69,7 +68,7 @@ export function NasBinding({ owner }: { owner: string }) {
       let result: Registration;
       if (resume) result = await registry.resume(onHash(current));
       else {
-        if (!keyAcknowledged) throw new Error("Confirm that you control and can retain the matching private key.");
+        if (!keyAcknowledged) throw new Error("Confirm that you trust this NAS to retain the matching private key.");
         // Recheck the authenticated NAS identity immediately before preparing the transaction.
         const nas = await getNasInfo();
         if (nas.peer_id !== peerId) throw new Error("The NAS PeerId changed. Refresh the registration details before continuing.");
@@ -92,12 +91,12 @@ export function NasBinding({ owner }: { owner: string }) {
     const current = generation.current;
     setBusy(true); setError("");
     try {
-      const value = await browserEncryptionKey(owner);
+      const { public_key: value } = await nasApi<{ public_key: string }>("content/key");
       if (generation.current === current) {
         setPublicKey(value); setKeyAcknowledged(false);
-        setMessage("The X25519 private key is stored only in this browser and cannot be exported. Clearing site data loses this key. No backup or recovery flow is available yet.");
+        setMessage("Your NAS holds the matching private key. Back up the NAS master key and user key files together. No private key was sent to this browser.");
       }
-    } catch { if (generation.current === current) setError("Unable to generate or retain the browser key. No transaction was sent. Use a supported browser or supply a public key whose private key you already hold."); }
+    } catch { if (generation.current === current) setError("Unable to prepare the NAS encryption key. Check the NAS key storage. No transaction was sent."); }
     finally { if (generation.current === current) setBusy(false); }
   }
 
@@ -129,7 +128,7 @@ export function NasBinding({ owner }: { owner: string }) {
         <dt>Registry</dt><dd>{registryAddress || "Not configured"}</dd>
         <dt>Wallet</dt><dd>{owner}</dd>
         <dt>Current NAS PeerId</dt><dd>{peerId || "Not available"}</dd></dl>
-      <p className="muted">The NAS identity persists across restarts. P2P transport is not running yet.</p>
+      <p className="muted">The NAS identity persists across restarts. Remote delivery requires reachable peers or a configured relay.</p>
       {loaded && record && <div>
         <dl><dt>Registered NAS PeerId</dt><dd>{record.nasPeerId}</dd>
           <dt>Encryption public key</dt><dd>{record.encryptionPublicKey}</dd>
@@ -141,10 +140,10 @@ export function NasBinding({ owner }: { owner: string }) {
     {editing && loaded && !record && !hash && peerId && <form aria-label="Register profile" onSubmit={event => { event.preventDefault(); void submit(); }}>
       <h4>Register your profile</h4>
       <label>Nickname<input autoFocus required value={nickname} disabled={busy} onChange={event => setNickname(event.target.value)} autoComplete="nickname" placeholder="Choose your display name" /></label>
-      <label>Encryption public key<input required value={publicKey} disabled={busy} onChange={event => { setPublicKey(event.target.value); setKeyAcknowledged(false); }} placeholder="Paste your public key (0x…)" spellCheck={false} /></label>
-      <p>Supply a public key whose private key you retain, or generate an X25519 key in this browser. Browser-generated keys have no recovery or export flow; clearing this site’s storage loses the private key.</p>
-      <button type="button" className="button demo" disabled={busy} onClick={() => void generateKey()}>Generate or reuse browser X25519 key</button>
-      <label className="key-acknowledgement"><input type="checkbox" required checked={keyAcknowledged} disabled={busy} onChange={event => setKeyAcknowledged(event.target.checked)} />I control the matching private key and understand its storage and recovery limitations.</label>
+      <label>Encryption public key<input required readOnly value={publicKey} disabled={busy} placeholder="Prepare your NAS public key below" spellCheck={false} /></label>
+      <p>Use your NAS-held X25519 key to receive and decrypt content while your browser is offline. Existing browser keys cannot be exported or migrated automatically.</p>
+      <button type="button" className="button demo" disabled={busy} onClick={() => void generateKey()}>Prepare NAS encryption public key</button>
+      <label className="key-acknowledgement"><input type="checkbox" required checked={keyAcknowledged} disabled={busy} onChange={event => setKeyAcknowledged(event.target.checked)} />I trust this NAS to hold my content decryption key and understand that NAS key files require backup.</label>
       <p>Your wallet address, NAS PeerId, encryption public key and nickname will be public on-chain. Private keys, avatar and gender are not submitted. Your wallet will ask you to confirm the transaction and gas fee.</p>
       <div className="binding-actions">
         <button className="button primary" disabled={busy || !keyAcknowledged} type="submit">{busy ? "Processing…" : "Confirm and register on Base Sepolia"}</button>

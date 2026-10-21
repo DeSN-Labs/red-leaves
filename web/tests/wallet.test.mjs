@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { getNasInfo, checkNasSession, connectWallet, logoutWallet, sessionExpiresAt } from "../src/wallet.ts";
+import { getNasInfo, checkNasSession, connectWallet, logoutWallet, sessionExpiresAt, nasApi, nasBlob, nasUpload, watchNasChanges } from "../src/wallet.ts";
 
 const address = `0x${"12".repeat(20)}`;
 const challenge = { challenge_id: "id", verifier: "secret", message: "Sign in to Red Leaves" };
@@ -109,4 +109,93 @@ test("profile registration requires a NAS node and explains outdated server endp
   await assert.rejects(getNasInfo(),/Restart the NAS server/);
   globalThis.fetch=async()=>response(null,204);
   await logoutWallet();
+});
+
+test("content requests use Bearer authentication and reject responses after logout", async () => {
+  provider(); let release, started;
+  const pending = new Promise(resolve => { started = resolve; });
+  const result = new Promise(resolve => { release = resolve; });
+  globalThis.fetch = async (url, options) => {
+    if (url.endsWith("challenge")) return response(challenge);
+    if (url.endsWith("verify")) return response({ token: "content-token", address, expires_at: 100 });
+    assert.equal(options.credentials, "omit");
+    assert.equal(options.headers.Authorization, "Bearer content-token");
+    if (url.endsWith("logout")) return response(null, 204);
+    assert.ok(url.endsWith("/api/posts")); return { ok: true, async json() { started(); return result; } };
+  };
+  await connectWallet(); const request = nasApi("posts"); await pending;
+  await logoutWallet(); release({ posts: [] });
+  await assert.rejects(request, /Wallet state changed/);
+  await assert.rejects(nasApi("posts"), /Sign in/);
+});
+
+test("media transfers use the session and discard blob responses after logout", async () => {
+ provider(); let release, started;
+ const pending = new Promise(resolve => { started = resolve; });
+ const result = new Promise(resolve => { release = resolve; });
+ globalThis.fetch = async (url, options) => {
+   if (url.endsWith("challenge")) return response(challenge);
+   if (url.endsWith("verify")) return response({ token: "media-token", address, expires_at: 100 });
+   assert.equal(options.headers.Authorization, "Bearer media-token");
+   assert.equal(options.credentials, "omit");
+   if (url.endsWith("logout")) return response(null, 204);
+   if (options.method === "POST") { assert.equal(options.headers["Content-Type"], "image/png"); assert(options.body instanceof File); return response({id:"upload"}); }
+   return { ok: true, async blob() { started(); return result; } };
+ };
+ await connectWallet();
+ assert.deepEqual(await nasUpload(new File(["png"], "a.png", {type:"image/png"})), {id:"upload"});
+ const request = nasBlob("media/test");await pending;await logoutWallet();release(new Blob(["private"]));
+ await assert.rejects(request,/Wallet state changed/);
+ await assert.rejects(nasBlob("media/test"),/Sign in/);
+});
+
+test("media downloads stay within two concurrent transfers", async () => {
+  provider(); let active = 0, maximum = 0, entered = 0;
+  const releases = [];
+  globalThis.fetch = async url => {
+    if (url.endsWith("challenge")) return response(challenge);
+    if (url.endsWith("verify")) return response({ token: "media-limit", address, expires_at: 100 });
+    if (url.endsWith("logout")) return response(null, 204);
+    active++; entered++; maximum = Math.max(maximum, active);
+    return { ok: true, async blob() { await new Promise(resolve => releases.push(resolve)); active--; return new Blob(["image"]); } };
+  };
+  await connectWallet();
+  const requests = Array.from({length:5}, (_,i) => nasBlob(`media/${i}`));
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(entered,2);
+  for(let i=0; i<5; i++) {
+    assert(releases.length > 0); releases.shift()();
+    await new Promise(resolve => setTimeout(resolve, 0));
+  }
+  assert.equal((await Promise.all(requests)).length,5);
+  assert.equal(maximum,2);
+  await logoutWallet();
+});
+
+test("live updates use Bearer SSE, decode fragmented frames and stop on cancellation", async () => {
+ provider(); const controller=new AbortController();let updates=0;
+ globalThis.fetch=async(url,options)=>{
+  if(url.endsWith("challenge"))return response(challenge);
+  if(url.endsWith("verify"))return response({token:"live",address,expires_at:100});
+  if(url.endsWith("logout"))return response(null,204);
+  assert(url.endsWith("/api/social/events"));assert(!url.includes("token="));
+  assert.equal(options.headers.Authorization,"Bearer live");assert.equal(options.credentials,"omit");
+  const encoder=new TextEncoder();
+  return new Response(new ReadableStream({start(stream){stream.enqueue(encoder.encode(": keepalive\n\nevent: sy"));stream.enqueue(encoder.encode("nc\ndata: {}\n\nevent: update\ndata: {}\n\n"));}}),{headers:{"Content-Type":"text/event-stream"}});
+ };
+ await connectWallet();
+ await watchNasChanges(()=>{updates++;if(updates===2)controller.abort();},controller.signal);
+ assert.equal(updates,2);await logoutWallet();
+});
+test("live updates never invoke callbacks from a buffered stream after logout", async () => {
+ provider();const controller=new AbortController();let updates=0,logout;
+ globalThis.fetch=async url=>{
+  if(url.endsWith("challenge"))return response(challenge);
+  if(url.endsWith("verify"))return response({token:"live-race",address,expires_at:100});
+  if(url.endsWith("logout"))return response(null,204);
+  return new Response(new ReadableStream({start(stream){stream.enqueue(new TextEncoder().encode("event: update\ndata: {}\n\nevent: update\ndata: {}\n\n"));}}));
+ };
+ await connectWallet();
+ await assert.rejects(watchNasChanges(()=>{updates++;logout=logoutWallet();},controller.signal),/Wallet state changed/);
+ await logout;assert.equal(updates,1);controller.abort();
 });

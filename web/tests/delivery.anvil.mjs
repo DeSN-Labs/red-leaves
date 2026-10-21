@@ -1,0 +1,113 @@
+// Real libp2p circuits: three temporary NAS processes share one temporary public relay.
+// Uses only Anvil's unlocked development accounts, never user deployment credentials.
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { resolve } from "node:path";
+import { createServer } from "node:net";
+import { fileURLToPath } from "node:url";
+import { createPublicClient, createWalletClient, http, keccak256, bytesToHex } from "viem";
+import { baseSepolia } from "viem/chains";
+import { encodeCanonical, actionsMatch } from "../src/content.ts";
+const root=fileURLToPath(new URL("../../",import.meta.url));
+const directory=await mkdtemp(resolve(tmpdir(),"red-leaves-delivery-"));
+const children=[];
+const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+async function port(){const server=createServer();await new Promise(resolve=>server.listen(0,"127.0.0.1",resolve));const p=server.address().port;await new Promise(resolve=>server.close(resolve));return p;}
+function child(command,args,options={}){const process=spawn(command,args,{stdio:["ignore","pipe","pipe"],...options});process.log="";process.stdout.on("data",d=>process.log+=d.toString());process.stderr.on("data",d=>process.log+=d.toString());children.push(process);return process;}
+async function until(task,label="condition",seconds=45){let last;for(let i=0;i<seconds*5;i++){try{return await task();}catch(error){last=error;await pause(200);}}throw new Error(`${label}: ${last?.message}`);}
+async function stop(process){if(process.exitCode!==null)return;process.kill("SIGTERM");await new Promise(resolve=>process.once("exit",resolve));}
+try {
+ const rpc=`http://127.0.0.1:${await port()}`;
+ child("anvil",["--silent","--chain-id","84532","--port",rpc.split(":").at(-1)]);
+ const client=createPublicClient({chain:baseSepolia,transport:http(rpc)});
+ await until(()=>client.getBlockNumber({cacheTime:0}));
+ const addresses=await client.request({method:"eth_accounts"});
+ const wallets=addresses.slice(0,4).map(account=>createWalletClient({account,chain:baseSepolia,transport:http(rpc)}));
+ async function deploy(name){const artifact=JSON.parse(await readFile(resolve(root,`contracts/out/${name}.sol/${name}.json`),"utf8"));const hash=await wallets[0].deployContract({abi:artifact.abi,bytecode:artifact.bytecode.object});return {address:(await client.waitForTransactionReceipt({hash})).contractAddress,abi:artifact.abi};}
+ const registry=await deploy("UserRegistry"),market=await deploy("PostAccess");
+ async function startNode(name,relay){
+  const path=resolve(directory,name);await import("node:fs/promises").then(fs=>fs.mkdir(path,{recursive:true}));
+  const api=`http://127.0.0.1:${await port()}`;
+  const env={...process.env,RED_LEAVES_LISTEN:api.slice(7),RED_LEAVES_DATABASE_URL:`sqlite://${resolve(path,"nas.sqlite")}`,RED_LEAVES_AUTH_URI:"http://127.0.0.1:5173",RED_LEAVES_NODE_KEY_PATH:resolve(path,"node.key"),RED_LEAVES_RPC_URL:rpc,RED_LEAVES_USER_REGISTRY_ADDRESS:registry.address,RED_LEAVES_POST_ACCESS_ADDRESS:market.address,RED_LEAVES_CONTENT_PATH:resolve(path,"content"),RED_LEAVES_USER_KEY_PATH:resolve(path,"keys"),RED_LEAVES_MASTER_KEY_PATH:resolve(path,"master.key"),RED_LEAVES_P2P_ENABLED:"true",RED_LEAVES_P2P_LISTEN:"/ip4/127.0.0.1/tcp/0",RED_LEAVES_P2P_RELAYS:relay??"",RED_LEAVES_P2P_PEERS:"",RED_LEAVES_P2P_RELAY_SERVER:relay?"false":"true"};
+  const node={api,path,env};
+  node.restart=async()=>{node.process=child(resolve(root,"target/debug/red-leaves"),[],{cwd:path,env});await until(async()=>{assert.equal(node.process.exitCode,null,node.process.log);const response=await fetch(`${api}/api/auth/me`);assert.equal(response.status,401);},`start ${name}`);};
+  await node.restart();return node;
+ }
+ async function request(node,path,body,token=node.token){const response=await fetch(`${node.api}/api/${path}`,{method:body===undefined?"GET":"POST",headers:{"Content-Type":"application/json",...(token?{Authorization:`Bearer ${token}`}:{})},...(body===undefined?{}:{body:JSON.stringify(body)})});return {status:response.status,body:await response.json()};}
+ async function login(node,index){const wallet=wallets[index];const challenge=(await request(node,"auth/challenge",{address:wallet.account.address})).body;const signature=await wallet.signMessage({message:challenge.message});const result=await request(node,"auth/verify",{challenge_id:challenge.challenge_id,verifier:challenge.verifier,signature});assert.equal(result.status,200,JSON.stringify(result.body));node.token=result.body.token;node.index=index;node.owner=wallet.account.address.toLowerCase();}
+ async function info(node){const response=await request(node,"nas/info");assert.equal(response.status,200);return response.body;}
+ const relay=await startNode("relay");await login(relay,3);
+ const relayAddress=await until(async()=>{const value=await info(relay);assert(value.p2p_addresses.length);return value.p2p_addresses[0];},"relay address");
+ const nodes=[];
+ for(let i=0;i<3;i++){
+  const node=await startNode(`nas-${i}`,relayAddress);await login(node,i);nodes.push(node);
+  const nas=await info(node);node.peer=nas.peer_id;
+  const key=(await request(node,"content/key")).body;
+  const hash=await wallets[i].writeContract({address:registry.address,abi:registry.abi,functionName:"register",args:[nas.peer_id,key.public_key,`User ${i}`]});await client.waitForTransactionReceipt({hash});
+  await until(async()=>assert((await info(node)).p2p_addresses.some(address=>address.includes("p2p-circuit"))),`relay reservation ${i}`);
+ }
+ console.log("Three NAS nodes reserved relay circuits.");
+ const [a,b,c]=nodes;
+ async function action(node,action){
+  const prepared=await request(node,"social/prepare",{action});assert.equal(prepared.status,200,JSON.stringify(prepared.body));const value=prepared.body,intent=value.intent;
+  assert(actionsMatch(intent.action,action));
+  const typedAction=action.action==="publish"?{action:"publish",post:{...intent.action.post,recipients:intent.action.post.recipients.map(v=>new Uint8Array(v))}}:{...intent.action,target:new Uint8Array(intent.action.target)};
+  const encoded=encodeCanonical({...intent,scope:{...intent.scope,registry_contract:new Uint8Array(intent.scope.registry_contract)},actor:new Uint8Array(intent.actor),nonce:new Uint8Array(intent.nonce),action:typedAction});assert.equal(bytesToHex(encoded),value.payload);assert.equal(keccak256(encoded),value.payload_hash);
+  const signature=await wallets[node.index].signTypedData({domain:{name:"RedLeaves",version:"1",chainId:84532,verifyingContract:registry.address},types:{SocialAction:[{name:"payloadHash",type:"bytes32"}]},primaryType:"SocialAction",message:{payloadHash:value.payload_hash}});
+  const committed=await request(node,"social/commit",{payload:value.payload,signature});assert.equal(committed.status,200,JSON.stringify(committed.body));return committed.body;
+ }
+ const walletBytes=node=>Array.from(Buffer.from(node.owner.slice(2),"hex"));
+ async function follow(node,target,enabled=true){return action(node,{action:"follow",target:walletBytes(target),enabled});}
+ async function publish(distribution="broadcast",targets=[],extra={}){return action(a,{action:"publish",post:{title:`Delivery ${distribution}`,body:"Signed content over a relay circuit",price_wei:"0",distribution,recipients:targets.map(walletBytes),...extra}});}
+ async function feed(node){const response=await request(node,"posts");assert.equal(response.status,200,JSON.stringify(response.body));return response.body.posts;}
+ async function has(node,id){assert((await feed(node)).some(post=>post.id===id));}
+ async function absent(node,id){assert(!(await feed(node)).some(post=>post.id===id));}
+ const prefs=(node,value)=>request(node,"social/preferences",value);
+ await follow(b,a);await follow(a,b);
+ await until(async()=>{const rel=(await request(a,"social/relationships")).body;assert(rel.followers.includes(b.owner));assert(rel.following.includes(b.owner));},"cross-NAS mutual follows");
+ await prefs(c,{broadcasts:true,following:false,followers:false,direct:true});
+ const sseAbort=new AbortController();const sse=await fetch(`${b.api}/api/social/events`,{headers:{Authorization:`Bearer ${b.token}`},signal:sseAbort.signal});assert.equal(sse.status,200);const reader=sse.body.getReader();await reader.read();
+ console.log("Cross-NAS follow synchronization passed.");
+ const publicPost=await publish();
+ await until(()=>has(b,publicPost.id),"public reception by following");await until(()=>has(c,publicPost.id),"public reception by broadcast preference");
+ const update=await Promise.race([reader.read(),pause(10000).then(()=>{throw new Error("Missing live inbox update");})]);assert(new TextDecoder().decode(update.value).includes("event: update"));sseAbort.abort();await reader.cancel().catch(()=>{});
+ console.log("Public delivery and live SSE passed.");
+ for(const scope of ["following","followers","friends"]){const post=await publish(scope,[b]);await until(()=>has(b,post.id),scope);await absent(c,post.id);assert.equal((await request(c,`posts/${post.id}`)).status,404);}
+ const direct=await publish("directed",[c]);await until(()=>has(c,direct.id),"explicit recipient");await absent(b,direct.id);
+ const blocked=await request(c,"social/blocks",{target:a.owner,blocked:true});assert.equal(blocked.status,200);
+ const hidden=await publish();await until(()=>has(b,hidden.id),"unblocked receiver");await pause(1000);await absent(c,hidden.id);
+ await request(c,"social/blocks",{target:a.owner,blocked:false});
+ await prefs(b,{broadcasts:false,following:false,followers:false,direct:false});
+ const filtered=await publish("directed",[b]);
+ await until(async()=>{const progress=(await request(a,`posts/${filtered.id}/delivery`)).body;assert.equal(progress.targets[0].state,"filtered");},"receiver preference filter");await absent(b,filtered.id);
+ await prefs(b,{broadcasts:false,following:true,followers:false,direct:true});
+ console.log("Scope, preference and block filters passed.");
+ const image=Buffer.concat([Buffer.from("89504e470d0a1a0a","hex"),Buffer.alloc(300000,42)]);
+ const uploadResponse=await fetch(`${a.api}/api/media`,{method:"POST",headers:{"Content-Type":"image/png",Authorization:`Bearer ${a.token}`},body:image});assert.equal(uploadResponse.status,200);const media=await uploadResponse.json();
+ const paid=await publish("directed",[b],{body:"",price_wei:"100",media:[media]});
+ const digest=`0x${paid.id.slice(4)}`;const hash=await wallets[0].writeContract({address:market.address,abi:market.abi,functionName:"registerPost",args:[digest,100n,paid.encrypted_key]});await client.waitForTransactionReceipt({hash});await client.request({method:"anvil_mine",params:["0x3"]});
+ assert.equal((await request(a,`posts/${paid.id}/activate`,{})).status,200);
+ await until(()=>has(b,paid.id),"paid notice");assert.equal((await request(b,`posts/${paid.id}`)).body.locked,true);assert.equal((await request(b,`posts/${paid.id}/unlock`,{})).status,402);
+ const purchase=await wallets[1].writeContract({address:market.address,abi:market.abi,functionName:"buyPost",args:[a.owner,digest],value:100n});await client.waitForTransactionReceipt({hash:purchase});await client.request({method:"anvil_mine",params:["0x3"]});
+ const unlocked=await request(b,`posts/${paid.id}/unlock`,{});assert.equal(unlocked.status,200,JSON.stringify(unlocked.body));assert(unlocked.body.paid_key_envelope);assert.equal(unlocked.body.intent.action.post.media[0].digest,media.digest);
+ const mediaResponse=await fetch(`${b.api}/api/posts/${paid.id}/media/${media.id}`,{headers:{Authorization:`Bearer ${b.token}`}});assert.equal(mediaResponse.status,200,await mediaResponse.clone().text());assert.deepEqual(Buffer.from(await mediaResponse.arrayBuffer()),image);
+ assert.equal((await request(c,`posts/${paid.id}/unlock`,{})).status,404);
+ console.log("Paid content and encrypted media passed.");
+ await stop(b.process);
+ const offline=await publish("directed",[b]);
+ await until(async()=>{const progress=(await request(a,`posts/${offline.id}/delivery`)).body;assert(progress.targets[0].attempts>0);assert.equal(progress.targets[0].state,"retrying");},"offline retry");
+ await stop(a.process);await a.restart();await b.restart();
+ await until(async()=>{assert.equal((await info(a)).peer_id,a.peer);assert.equal((await info(b)).peer_id,b.peer);await has(b,offline.id);},"restart delivery",70);
+ await until(async()=>{const progress=(await request(a,`posts/${offline.id}/delivery`)).body;assert.equal(progress.targets[0].state,"delivered");},"receiver save acknowledgment");
+ await stop(a.process);
+ const cached=await request(b,`posts/${offline.id}`);assert.equal(cached.status,200);assert.equal(cached.body.intent.action.post.body,"Signed content over a relay circuit");
+ console.log("Delivery integration passed: relay circuits, all scopes, follow synchronization, live SSE, reception/block filters, paid unlock, encrypted media chunks, offline retry, durable restart and offline cached reading.");
+} catch(error) {
+ for(const process of children){if(process.log) console.error(process.log.slice(-3000));}
+ throw error;
+} finally {
+ for(const process of children.reverse()){if(process.exitCode===null)process.kill("SIGTERM");}
+ await pause(300);await rm(directory,{recursive:true,force:true});
+}

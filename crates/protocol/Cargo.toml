@@ -16,6 +16,10 @@ thiserror.workspace = true
 libp2p-core.workspace = true
 libp2p-identity.workspace = true
 multiaddr.workspace = true
+aes-gcm.workspace = true
+hpke.workspace = true
+rand09.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 hex.workspace = true

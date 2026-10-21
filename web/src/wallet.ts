@@ -23,6 +23,96 @@ async function api<T>(path: string, body?: unknown, bearer?: string): Promise<T>
   return response.status === 204 ? undefined as T : response.json();
 }
 export const sessionExpiresAt = () => expiresAt;
+export async function nasApi<T>(path: string, body?: unknown): Promise<T> {
+  const currentToken = token, currentRevision = revision;
+  if (!currentToken) throw new Error("Sign in with your wallet to use your NAS.");
+  const response = await fetch(`${apiBaseUrl}/api/${path}`, {
+    method: body === undefined ? "GET" : "POST", credentials: "omit",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${currentToken}` },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(65000),
+  });
+  if (currentToken !== token || currentRevision !== revision) throw new Error("Wallet state changed. Please sign in again.");
+  if (!response.ok) {
+    const value = await response.json().catch(() => null) as { error?: string } | null;
+    throw new Error(value?.error ?? `NAS request failed (${response.status}).`);
+  }
+  const result = await response.json() as T;
+  if (currentToken !== token || currentRevision !== revision) throw new Error("Wallet state changed. Please sign in again.");
+  return result;
+}
+let mediaTransfers = 0;
+const mediaWaiters: (() => void)[] = [];
+async function nasTransfer<T>(path: string, file?: File, signal?: AbortSignal): Promise<T> {
+  const currentToken = token, currentRevision = revision;
+  if (!currentToken) throw new Error("Sign in with your wallet to use your NAS.");
+  // Match the NAS transfer bound so a visible gallery does not flood it with requests.
+  if (mediaTransfers >= 2) await new Promise<void>(resolve => mediaWaiters.push(resolve));
+  else mediaTransfers++;
+  try {
+    signal?.throwIfAborted();
+    if (currentToken !== token || currentRevision !== revision) throw new Error("Wallet state changed. Please sign in again.");
+    const response = await fetch(`${apiBaseUrl}/api/${path}`, {
+      method: file ? "POST" : "GET", credentials: "omit",
+      headers: { Authorization: `Bearer ${currentToken}`, ...(file ? { "Content-Type": file.type } : {}) },
+      ...(file ? { body: file } : {}), signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(65000)]) : AbortSignal.timeout(65000),
+    });
+    if (currentToken !== token || currentRevision !== revision) throw new Error("Wallet state changed. Please sign in again.");
+    if (!response.ok) {
+      const error = await response.json().catch(() => null) as { error?: string } | null;
+      throw new Error(error?.error ?? `NAS media request failed (${response.status}).`);
+    }
+    const result = file ? await response.json() : await response.blob();
+    if (currentToken !== token || currentRevision !== revision) throw new Error("Wallet state changed. Please sign in again.");
+    return result as T;
+  } finally {
+    const next = mediaWaiters.shift();
+    if (next) next(); else mediaTransfers--;
+  }
+}
+export const nasUpload = <T>(file: File) => nasTransfer<T>("media", file);
+export const nasBlob = (path: string, signal?: AbortSignal) => nasTransfer<Blob>(path, undefined, signal);
+export async function watchNasChanges(onChange: () => void, signal: AbortSignal): Promise<void> {
+  const currentToken = token, currentRevision = revision;
+  if (!currentToken) throw new Error("Sign in with your wallet to receive updates.");
+  while (!signal.aborted) {
+    if (token !== currentToken || revision !== currentRevision) throw new Error("Wallet state changed. Please sign in again.");
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/social/events`, {
+        credentials: "omit", headers: { Authorization: `Bearer ${currentToken}`, Accept: "text/event-stream" },
+        signal: AbortSignal.any([signal, AbortSignal.timeout(90000)]),
+      });
+      if (response.status === 401) throw new Error("The NAS session expired. Sign in again.");
+      if (!response.ok || !response.body) throw new Error("Live NAS updates are unavailable.");
+      const reader = response.body.getReader(), decoder = new TextDecoder();
+      let buffer = "";
+      try {
+        for (;;) {
+          if (signal.aborted) return;
+          const result = await reader.read();
+          if (signal.aborted) return;
+          if (token !== currentToken || revision !== currentRevision) throw new Error("Wallet state changed. Please sign in again.");
+          if (result.done) break;
+          buffer += decoder.decode(result.value, { stream: true }).replace(/\r/g, "");
+          if (buffer.length > 65536) throw new Error("Invalid NAS event stream.");
+          let boundary: number;
+          while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+            if (signal.aborted) return;
+            if (token !== currentToken || revision !== currentRevision) throw new Error("Wallet state changed. Please sign in again.");
+            const event = buffer.slice(0, boundary); buffer = buffer.slice(boundary + 2);
+            if (/^event:\s*(update|sync)\s*$/m.test(event)) onChange();
+          }
+        }
+      } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+    } catch (cause) {
+      if (signal.aborted) return;
+      if (token !== currentToken || revision !== currentRevision || (cause instanceof Error && cause.message.includes("session expired"))) throw cause;
+    }
+    await new Promise<void>(resolve => {
+      const finish = () => { clearTimeout(timer); signal.removeEventListener("abort", finish); resolve(); };
+      const timer = setTimeout(finish, 3000); signal.addEventListener("abort", finish, { once: true });
+    });
+  }
+}
 export async function getNasInfo() {
   const currentToken = token;
   if (!currentToken) throw new Error("Sign in with your wallet to connect to the NAS.");

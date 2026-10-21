@@ -23,7 +23,8 @@ import {
 } from "lucide-react";
 import { posts, photo, type Post } from "./data";
 import { apiBaseUrl, checkNasSession, connectWallet, logoutWallet, sessionExpiresAt, shortAddress } from "./wallet";
-const NasBinding = React.lazy(() => import("./NasBinding").then(module => ({ default: module.NasBinding })));
+const Profile = React.lazy(() => import("./Profile").then(module => ({ default: module.Profile })));
+const Publishing = React.lazy(() => import("./Publishing").then(module => ({ default: module.Publishing })));
 import "./styles.css";
 
 function Brand() {
@@ -285,7 +286,7 @@ function App() {
         p.author === page) &&
       `${p.title}${p.author}${p.description}`.includes(query),
   );
-  const feedPage = !["我的 NAS", "我的发布"].includes(page);
+  const feedPage = !["我的 NAS", "我的发布", "个人资料"].includes(page);
   return (
     <div className="app-shell">
       <header className="app-header">
@@ -309,14 +310,14 @@ function App() {
           />
         </form>
         <div className="header-actions">
-          <span className="preview-badge">演示内容</span>
+          <span className="preview-badge">{session.mode === "demo" ? "Demo content" : "NAS content"}</span>
           <button
             className="button publish"
             disabled={checkingNas}
             onClick={() => void checkNas(true)}
           >
             <Plus size={17} />
-            发布内容
+            Publish
           </button>
           <button
             className="user-avatar"
@@ -405,10 +406,9 @@ function App() {
             <ChevronRight size={15} />
           </div>
           <div className="wallet-mini">
-            <Wallet size={15} />
-            <span>
-              {session.address ? shortAddress(session.address) : "演示身份"}
-            </span>
+            <button className="wallet-profile" aria-label="Open personal profile" disabled={session.mode !== "wallet"} onClick={() => navigate("个人资料")}>
+              <Wallet size={17} /><span>{session.address ? shortAddress(session.address) : "演示身份"}</span><ChevronRight size={14} />
+            </button>
             <button
               className="icon-button"
               aria-label="Sign out"
@@ -437,7 +437,6 @@ function App() {
           我的空间 <ChevronRight size={13} />
           <span>{page}</span>
         </div>
-        {session.mode === "wallet" && session.address && <React.Suspense fallback={<p role="status">Checking profile registration…</p>}><NasBinding key={session.address} owner={session.address} /></React.Suspense>}
         <div className="page-heading">
           <div>
             <h1>{page === "关注动态" ? "每一份分享，都值得停留。" : page}</h1>
@@ -453,7 +452,11 @@ function App() {
           </div>
           <span className="date-label">RED LEAVES / YOUR SPACE</span>
         </div>
-        {page === "我的关注" ? (
+        {session.mode === "wallet" && session.address && page === "个人资料" ? (
+          <React.Suspense fallback={<p role="status">Loading profile…</p>}><Profile key={session.address} owner={session.address} /></React.Suspense>
+        ) : session.mode === "wallet" && session.address && ["关注动态", "我的发布", "我的关注"].includes(page) ? (
+          <React.Suspense fallback={<p role="status">Loading content…</p>}><Publishing key={`${session.address}:${page}`} owner={session.address} page={page === "我的发布" ? "publish" : page === "我的关注" ? "relationships" : "feed"} /></React.Suspense>
+        ) : page === "我的关注" ? (
           <section className="creator-list">
             {["山间来信", "阿禾的日常", "字节花园"].map((name) => (
               <button key={name} onClick={() => navigate(name)}>
@@ -488,10 +491,10 @@ function App() {
         ) : page === "我的发布" ? (
           <section className="empty-state">
             <Leaf size={42} />
-            <h2>{nasConnected ? "NAS connected · Publishing pending" : "Publishing is not available yet"}</h2>
+            <h2>{nasConnected ? "Wallet sign-in required" : "Publishing is not available yet"}</h2>
             <p>{nasConnected
-              ? "You are authenticated with your NAS. The content publishing and file upload APIs are not implemented yet."
-              : "Sign in with your wallet and verify the NAS connection. Content publishing and file uploads are not implemented yet."}</p>
+              ? "Sign in with your wallet to publish signed posts to your NAS. Demo notes cannot be sent."
+              : "Sign in with your wallet and verify the NAS connection to publish posts."}</p>
             <button
               className="button demo"
               onClick={() => navigate("关注动态")}

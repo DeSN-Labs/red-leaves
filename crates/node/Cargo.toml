@@ -9,12 +9,16 @@ default = ["nas"]
 nas = [
     "dep:sqlx", "sqlx/sqlite", "dep:axum", "dep:tokio", "dep:serde",
     "dep:siwe", "dep:rand", "dep:sha2", "dep:hex", "dep:time", "dep:tower-http", "dep:dotenvy",
+    "dep:serde_json", "dep:reqwest", "dep:alloy-sol-types", "dep:zeroize", "dep:futures",
 ]
-relay = ["dep:sqlx", "sqlx/postgres", "sqlx/tls-rustls-ring"]
+relay = ["dep:sqlx", "sqlx/postgres", "sqlx/tls-rustls-ring", "dep:tokio", "dep:serde", "dep:serde_json", "dep:futures", "dep:dotenvy", "dep:hex"]
 
 [dependencies]
 red-leaves-protocol.workspace = true
 libp2p.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
 sqlx = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
@@ -28,6 +32,11 @@ time = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
 
 dotenvy = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+alloy-sol-types = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
 
 [dev-dependencies]
 k256 = { version = "0.13", features = ["ecdsa"] }

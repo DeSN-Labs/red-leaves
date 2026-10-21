@@ -7,6 +7,7 @@ import type { Provider } from "./wallet.ts";
 
 export const registryAddress = import.meta.env?.VITE_USER_REGISTRY_ADDRESS ?? "";
 export const registryAbi = [
+  { type: "function", name: "updateEncryptionPublicKey", stateMutability: "nonpayable", inputs: [{ name: "encryptionPublicKey", type: "bytes" }], outputs: [] },
   { type: "function", name: "isRegistered", stateMutability: "view", inputs: [{ name: "owner", type: "address" }], outputs: [{ type: "bool" }] },
   { type: "function", name: "getUser", stateMutability: "view", inputs: [{ name: "owner", type: "address" }], outputs: [{ type: "tuple", components: [{ name: "nasPeerId", type: "string" }, { name: "encryptionPublicKey", type: "bytes" }, { name: "nickname", type: "string" }] }] },
   { type: "function", name: "register", stateMutability: "nonpayable", inputs: [{ name: "nasPeerId", type: "string" }, { name: "encryptionPublicKey", type: "bytes" }, { name: "nickname", type: "string" }], outputs: [] },

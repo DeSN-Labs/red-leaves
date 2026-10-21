@@ -6,11 +6,14 @@
 
 pub mod canonical;
 pub mod codec;
+pub mod delivery;
+pub mod encryption;
 pub mod event;
 pub mod file;
 pub mod handshake;
 pub mod receipt;
 pub mod route;
+pub mod social;
 pub mod types;
 pub mod wire;
 
