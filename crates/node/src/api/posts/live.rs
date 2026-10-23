@@ -23,7 +23,7 @@ pub(super) async fn events(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    let token_hash = identity::hash(bearer(&headers)?);
+    let token_hash = identity::hash(session_token(&headers)?);
     let viewer = owner(&state, headers).await?;
     let service = state.config.posts.clone().ok_or_else(unavailable)?;
     {

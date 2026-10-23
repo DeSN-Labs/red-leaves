@@ -138,7 +138,10 @@ async fn call(
         .unwrap();
     assert_eq!(response.headers()["cache-control"], "no-store");
     assert!(!response.headers().contains_key("set-cookie"));
-    assert_eq!(response.headers()["access-control-allow-origin"], "*");
+    assert_eq!(
+        response.headers()["access-control-allow-origin"],
+        "http://localhost:5173"
+    );
     let status = response.status();
     let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
     (
@@ -295,13 +298,13 @@ async fn session_expiry_and_cookie_alone_are_rejected() {
         .oneshot(
             Request::builder()
                 .uri("/api/auth/me")
-                .header("cookie", format!("session={token}"))
+                .header("cookie", format!("red_leaves_session={token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
     sqlx::query("UPDATE auth_sessions SET expires_at=0")
         .execute(&pool)
         .await
@@ -492,7 +495,7 @@ async fn cross_origin_preflight_and_authentication_responses() {
             Request::builder()
                 .method("OPTIONS")
                 .uri("/api/auth/verify")
-                .header("origin", "http://127.0.0.1:5173")
+                .header("origin", "http://localhost:5173")
                 .header("access-control-request-method", "POST")
                 .header(
                     "access-control-request-headers",
@@ -505,7 +508,10 @@ async fn cross_origin_preflight_and_authentication_responses() {
         .unwrap();
     assert!(response.status().is_success());
     let headers = response.headers();
-    assert_eq!(headers["access-control-allow-origin"], "*");
+    assert_eq!(
+        headers["access-control-allow-origin"],
+        "http://localhost:5173"
+    );
     assert!(
         headers["access-control-allow-methods"]
             .to_str()
@@ -517,7 +523,7 @@ async fn cross_origin_preflight_and_authentication_responses() {
         .unwrap()
         .to_lowercase();
     assert!(allowed.contains("content-type") && allowed.contains("authorization"));
-    assert!(!headers.contains_key("access-control-allow-credentials"));
+    assert_eq!(headers["access-control-allow-credentials"], "true");
 
     let response = app
         .oneshot(
@@ -530,11 +536,13 @@ async fn cross_origin_preflight_and_authentication_responses() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(response.headers()["access-control-allow-origin"], "*");
-    assert!(
-        !response
-            .headers()
-            .contains_key("access-control-allow-credentials")
+    assert_eq!(
+        response.headers()["access-control-allow-origin"],
+        "http://localhost:5173"
+    );
+    assert_eq!(
+        response.headers()["access-control-allow-credentials"],
+        "true"
     );
 }
 
@@ -576,4 +584,210 @@ async fn nas_identity_requires_session_and_exposes_only_public_fields() {
     assert_eq!(info["p2p_running"], false);
     assert_eq!(info["node_type"], "nas");
     assert_eq!(info.as_object().unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn browser_cookie_login_access_csrf_and_logout() {
+    let (app, pool) = setup().await;
+    let key = key(19);
+    let challenge = challenge_for(&app, &key).await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/verify")
+                .header("content-type", "application/json")
+                .header("origin", "http://localhost:5173")
+                .header("x-red-leaves-client", "web")
+                .body(Body::from(signed(&challenge, &key).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["access-control-allow-credentials"],
+        "true"
+    );
+    let cookie = response.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(cookie.contains("; HttpOnly; SameSite=Lax; Max-Age=3600"));
+    assert!(cookie.contains("; Path=/api"));
+    assert!(!cookie.contains("Domain="));
+    assert!(!cookie.contains("; Secure"));
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
+    assert!(body.get("token").is_none());
+    assert_eq!(body["chain_id"], CHAIN_ID);
+    let cookie = cookie.split(';').next().unwrap();
+    for (origin, client, path, expected) in [
+        (
+            Some("http://localhost:5173"),
+            true,
+            "/api/auth/me",
+            StatusCode::OK,
+        ),
+        (None, true, "/api/nas/info", StatusCode::OK),
+        (
+            Some("https://attacker.example"),
+            true,
+            "/api/auth/me",
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            Some("http://localhost:5173"),
+            false,
+            "/api/auth/me",
+            StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let mut request = Request::builder().uri(path).header("cookie", cookie);
+        if let Some(origin) = origin {
+            request = request.header("origin", origin);
+        }
+        if client {
+            request = request.header("x-red-leaves-client", "web");
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+    }
+    // An untrusted site cannot revoke a valid session.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/logout")
+                .header("cookie", cookie)
+                .header("origin", "https://attacker.example")
+                .header("x-red-leaves-client", "web")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM auth_sessions")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/logout")
+                    .header("cookie", cookie)
+                    .header("x-red-leaves-client", "web")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            response.headers()["set-cookie"]
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=0")
+        );
+    }
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/me")
+                .header("cookie", cookie)
+                .header("x-red-leaves-client", "web")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn cookie_auth_rejects_expired_ambiguous_and_malformed_credentials() {
+    let (app, pool) = setup().await;
+    let key = key(20);
+    let challenge = challenge_for(&app, &key).await;
+    let (_, session) = call(
+        &app,
+        "POST",
+        "/api/auth/verify",
+        signed(&challenge, &key),
+        None,
+    )
+    .await;
+    let token = session["token"].as_str().unwrap();
+    let cookie = format!("red_leaves_session={token}");
+    for (cookie, authorization) in [
+        (format!("{cookie}; {cookie}"), None),
+        ("red_leaves_session=bad".to_owned(), None),
+        (cookie.clone(), Some("Basic invalid")),
+    ] {
+        let mut request = Request::builder()
+            .uri("/api/auth/me")
+            .header("cookie", cookie)
+            .header("x-red-leaves-client", "web");
+        if let Some(value) = authorization {
+            request = request.header("authorization", value);
+        }
+        assert_eq!(
+            app.clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    sqlx::query("UPDATE auth_sessions SET expires_at=0")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        app.oneshot(
+            Request::builder()
+                .uri("/api/auth/me")
+                .header("cookie", cookie)
+                .header("x-red-leaves-client", "web")
+                .body(Body::empty())
+                .unwrap()
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[test]
+fn https_session_cookies_are_secure_and_expire_with_matching_attributes() {
+    let config = Config {
+        posts: None,
+        listen: "127.0.0.1:3000".into(),
+        domain: "web.example".into(),
+        uri: "https://web.example".into(),
+        peer_id: "test".into(),
+    };
+    for (value, max_age) in [("ab".repeat(32), SESSION_SECONDS), (String::new(), 0)] {
+        let cookie = session_cookie(&config, &value, max_age);
+        let cookie = cookie.to_str().unwrap();
+        assert!(cookie.ends_with("; Secure"));
+        assert!(cookie.contains("HttpOnly; SameSite=Lax"));
+        assert!(cookie.contains(&format!("Max-Age={max_age}")));
+    }
 }

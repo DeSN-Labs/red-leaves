@@ -227,25 +227,15 @@ async fn read(
     }
     let post = load(&state, &post_id, &viewer).await?;
     let author: String = post.get("author");
-    if author != viewer && post.get::<String, _>("price_wei") != "0" {
-        let chain = service(&state)?.chain.as_ref().ok_or_else(unavailable)?;
-        if post.get::<Option<String>, _>("market") != chain.market.map(wallet) {
-            return Err(unavailable());
-        }
-        if !chain
-            .has_paid(address(&author)?, digest_id(&post_id)?, address(&viewer)?)
-            .await
-            .map_err(|_| unavailable())?
-        {
-            return Err(ApiError(
-                StatusCode::PAYMENT_REQUIRED,
-                "Payment has not been confirmed on Base Sepolia",
-            ));
-        }
-    }
     let stored = load_object(&post)?;
     let payload = decode_content(service(&state)?, &post, &post_id, &stored)?;
-    let intent: Intent = canonical::decode(&payload, 32 * 1024).map_err(|_| unavailable())?;
+    let intent = red_leaves_protocol::social::verify_post(
+        &payload,
+        &bytes(&stored.signature)?,
+        ContentId::from_slice(&bytes(&post_id)?).map_err(|_| bad())?,
+        &service(&state)?.scope().map_err(|_| unavailable())?,
+    )
+    .map_err(|_| unavailable())?;
     let Action::Publish { post } = intent.action else {
         return Err(unavailable());
     };
@@ -265,7 +255,7 @@ async fn discard(
     if row.get::<String, _>("owner") != viewer {
         return Err(forbidden());
     }
-    // Referenced files cannot be deleted, including those awaiting a paid listing.
+    // Referenced files remain part of a signed publication.
     let deleted = sqlx::query("DELETE FROM social_media WHERE id=? AND owner=? AND NOT EXISTS(SELECT 1 FROM social_post_media WHERE media_id=?)")
         .bind(&id).bind(&viewer).bind(&id).execute(&state.pool).await?;
     if deleted.rows_affected() == 0 {

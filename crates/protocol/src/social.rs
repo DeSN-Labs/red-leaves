@@ -66,11 +66,8 @@ impl Media {
 pub struct PostDraft {
     pub title: String,
     pub body: String,
-    /// Integer wei, fixed to native Base Sepolia test ETH. Zero means free.
-    pub price_wei: String,
     pub distribution: Distribution,
     pub recipients: Vec<Address>,
-    // Omit empty attachments to preserve the canonical bytes and IDs of existing text posts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<Media>,
 }
@@ -84,7 +81,6 @@ impl PostDraft {
         {
             return Err(Error::InvalidMessage);
         }
-        let _ = price(&self.price_wei)?;
         if self.media.len() > 9 {
             return Err(Error::InvalidMessage);
         }
@@ -109,17 +105,6 @@ impl PostDraft {
         Ok(())
     }
 }
-pub fn price(value: &str) -> Result<u128> {
-    if value.is_empty()
-        || value.len() > 30
-        || !value.bytes().all(|b| b.is_ascii_digit())
-        || (value.len() > 1 && value.starts_with('0'))
-    {
-        return Err(Error::InvalidMessage);
-    }
-    value.parse().map_err(|_| Error::InvalidMessage)
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
@@ -193,4 +178,21 @@ impl Intent {
         event::verify_eoa(intent.signing_hash()?, signature, intent.actor)?;
         Ok(intent)
     }
+}
+
+/// Verify a saved publication using the current schema without reapplying submission expiry.
+pub fn verify_post(
+    payload: &[u8],
+    signature: &[u8],
+    expected_id: ContentId,
+    scope: &NetworkScope,
+) -> Result<Intent> {
+    let intent: Intent = canonical::decode(payload, 32 * 1024)?;
+    intent.validate()?;
+    intent.scope.ensure_matches(scope)?;
+    if !matches!(intent.action, Action::Publish { .. }) || intent.id()? != expected_id {
+        return Err(Error::InvalidMessage);
+    }
+    intent.verify_signature(signature)?;
+    Ok(intent)
 }

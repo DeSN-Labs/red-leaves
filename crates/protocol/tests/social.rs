@@ -24,7 +24,6 @@ fn action() -> (Intent, SigningKey) {
                     title: "Title".into(),
                     media: vec![],
                     body: "Secret text".into(),
-                    price_wei: "0".into(),
                     distribution: Distribution::Broadcast,
                     recipients: vec![],
                 },
@@ -40,7 +39,7 @@ fn signature(action: &Intent, key: &SigningKey) -> Vec<u8> {
     [signature.to_bytes().as_slice(), &[recovery.to_byte() + 27]].concat()
 }
 #[test]
-fn publication_signature_binds_action_scope_audience_price_and_expiry() {
+fn publication_signature_binds_action_scope_audience_content_and_expiry() {
     let (intent, key) = action();
     let signature = signature(&intent, &key);
     let encoded = intent.encode().unwrap();
@@ -70,7 +69,7 @@ fn publication_signature_binds_action_scope_audience_price_and_expiry() {
     let Action::Publish { ref mut post } = changed.action else {
         unreachable!()
     };
-    post.price_wei = "1".into();
+    post.body = "Changed body".into();
     assert!(
         Intent::verify(
             &changed.encode().unwrap(),
@@ -83,16 +82,11 @@ fn publication_signature_binds_action_scope_audience_price_and_expiry() {
     );
 }
 #[test]
-fn recipients_and_prices_have_unambiguous_bounds() {
+fn recipients_have_unambiguous_bounds() {
     let (intent, _) = action();
     let Action::Publish { mut post } = intent.action else {
         unreachable!()
     };
-    for price in ["01", "-1", "0.1", ""] {
-        post.price_wei = price.into();
-        assert!(post.validate(intent.actor).is_err());
-    }
-    post.price_wei = "1".into();
     post.distribution = Distribution::Directed;
     assert!(post.validate(intent.actor).is_err());
     post.recipients = vec![Address([1; 20]), Address([1; 20])];
@@ -124,30 +118,14 @@ fn symmetric_encryption_authenticates_ciphertext_and_context() {
     assert!(encryption::open(&key, &sealed, b"post/id").is_err());
 }
 #[test]
-fn paid_layer_remains_locked_after_transport_decryption() {
-    let paid_key = encryption::random_key().unwrap();
-    let transport = encryption::random_key().unwrap();
-    let paid = encryption::seal(&paid_key, b"Paid plaintext", b"paid/post").unwrap();
-    let outer = encryption::seal(&transport, &paid.ciphertext, b"transport/post").unwrap();
-    let delivered = encryption::open(&transport, &outer, b"transport/post").unwrap();
-    assert_ne!(&**delivered, b"Paid plaintext");
-    assert_eq!(&**delivered, &paid.ciphertext);
-    assert!(encryption::open(&transport, &paid, b"paid/post").is_err());
-    assert_eq!(
-        &**encryption::open(&paid_key, &paid, b"paid/post").unwrap(),
-        b"Paid plaintext"
-    );
-}
-
-#[test]
-fn media_formats_are_signed_and_legacy_text_encoding_remains_compatible() {
+fn media_formats_are_signed_and_empty_attachments_are_omitted() {
     use red_leaves_protocol::social::Media;
     let (mut intent, key) = action();
-    let legacy = intent.encode().unwrap();
+    let text_payload = intent.encode().unwrap();
     let json = serde_json::to_value(&intent).unwrap();
     assert!(json["action"]["post"].get("media").is_none());
     assert_eq!(
-        red_leaves_protocol::canonical::decode::<Intent>(&legacy, 32768).unwrap(),
+        red_leaves_protocol::canonical::decode::<Intent>(&text_payload, 32768).unwrap(),
         intent
     );
     let signature = signature(&intent, &key);
@@ -190,8 +168,6 @@ fn delivery_notices_reject_private_titles_wrong_scope_and_unbounded_fields() {
         author: intent.actor,
         source_peer: intent.nas_peer_id.clone(),
         distribution: Distribution::Broadcast,
-        price_wei: "0".into(),
-        market: None,
         created_at: 1000,
         title: "Public title".into(),
     };
@@ -199,10 +175,6 @@ fn delivery_notices_reject_private_titles_wrong_scope_and_unbounded_fields() {
     notice.distribution = Distribution::Directed;
     assert!(notice.validate(&intent.scope, 1001).is_err());
     notice.title.clear();
-    assert!(notice.validate(&intent.scope, 1001).is_ok());
-    notice.price_wei = "100".into();
-    assert!(notice.validate(&intent.scope, 1001).is_err());
-    notice.market = Some(Address([8; 20]));
     assert!(notice.validate(&intent.scope, 1001).is_ok());
     notice.title = "Encrypted title must not leak".into();
     assert!(notice.validate(&intent.scope, 1001).is_err());

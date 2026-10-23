@@ -89,7 +89,7 @@ export function createRegistry(provider: Provider, contract: string, owner: stri
       validateRegistration(input);
       if (pending()) throw new Error("Resume the pending transaction before submitting another registration.");
       if (await read()) throw new Error("This wallet is already registered. Refresh its on-chain record.");
-      // Ensure pending-transaction storage is available before requesting a paid transaction.
+      // Ensure pending-transaction storage is available before requesting an on-chain registration transaction.
       storage.setItem(`${storageKey}:probe`, JSON.stringify({ ...input, hash: `0x${"0".repeat(64)}` }));
       storage.removeItem(`${storageKey}:probe`);
       const { request } = await client.simulateContract({ address, abi: registryAbi, functionName: "register", args: [input.nasPeerId, input.encryptionPublicKey, input.nickname], account });

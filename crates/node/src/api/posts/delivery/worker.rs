@@ -22,9 +22,7 @@ async fn deliver_local(
         return Ok(NetResponse::Ignored);
     }
     save_inbox(state, target, notice, None).await?;
-    Ok(NetResponse::Saved {
-        body: notice.price_wei == "0",
-    })
+    Ok(NetResponse::Saved { body: true })
 }
 async fn deliver_post(state: &AppState, id: &str, target: &str) -> Result<&'static str, ApiError> {
     let n = notice(state, id).await?;
@@ -55,7 +53,6 @@ async fn deliver_post(state: &AppState, id: &str, target: &str) -> Result<&'stat
     };
     match response {
         NetResponse::Saved { body: true } => Ok("delivered"),
-        NetResponse::Saved { body: false } => Ok("notified"),
         NetResponse::Ignored => Ok("filtered"),
         _ => Err(unavailable()),
     }

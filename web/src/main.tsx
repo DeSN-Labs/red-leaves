@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import {
   ArrowDown,
   ArrowRight,
+  Bell,
   Bookmark,
   Check,
   ChevronRight,
@@ -22,7 +23,7 @@ import {
   X,
 } from "lucide-react";
 import { posts, photo, type Post } from "./data";
-import { apiBaseUrl, checkNasSession, connectWallet, logoutWallet, sessionExpiresAt, shortAddress } from "./wallet";
+import { apiBaseUrl, checkNasSession, connectWallet, availableWallets, preferredWalletId, getWalletProvider, type WalletChoice, logoutWallet, restoreWallet, sessionExpiresAt, shortAddress } from "./wallet";
 const Profile = React.lazy(() => import("./Profile").then(module => ({ default: module.Profile })));
 const Publishing = React.lazy(() => import("./Publishing").then(module => ({ default: module.Publishing })));
 import "./styles.css";
@@ -42,6 +43,9 @@ type Session = { mode: "demo" | "wallet"; address?: string };
 function App() {
   const [session, setSession] = useState<Session | null>(null);
   const [busy, setBusy] = useState(false);
+  const [walletChoices, setWalletChoices] = useState<WalletChoice[]>([]);
+  const [restoring, setRestoring] = useState(true);
+  const [restoreFailed, setRestoreFailed] = useState(false);
   const [nasAvailable, setNasAvailable] = useState(true);
   const [checkingNas, setCheckingNas] = useState(false);
   const [error, setError] = useState("");
@@ -53,7 +57,28 @@ function App() {
   const [notice, setNotice] = useState("");
   const [mobileNav, setMobileNav] = useState(false);
   useEffect(() => {
-    const provider = window.ethereum;
+    let active = true;
+    void restoreWallet().then(address => {
+      if (active && address) { setSession({ mode: "wallet", address }); setNasAvailable(true); setPage("我的 NAS"); }
+    }).catch(cause => {
+      if (active) { setRestoreFailed(true); setError(cause instanceof Error ? cause.message : "Unable to restore your NAS session. Retry the connection."); }
+    }).finally(() => { if (active) setRestoring(false); });
+    return () => { active = false; };
+  }, []);
+  const retryRestore = async () => {
+    setRestoring(true); setError(""); setRestoreFailed(false);
+    try {
+      const address = await restoreWallet();
+      if (address) { setSession({ mode: "wallet", address }); setNasAvailable(true); setPage("我的 NAS"); }
+    } catch (cause) {
+      setRestoreFailed(true);
+      setError(cause instanceof Error ? cause.message : "Unable to restore your NAS session. Retry the connection.");
+    } finally { setRestoring(false); }
+  };
+  useEffect(() => {
+    if (session?.mode !== "wallet") return;
+    let provider;
+    try { provider = getWalletProvider(); } catch { return; }
     const reset = () => {
       setSession(null);
       setSelected(null);
@@ -116,11 +141,17 @@ function App() {
       previous?.focus();
     };
   }, [selected]);
-  const connect = async () => {
+  const connect = async (selected?: WalletChoice, changeWallet = false) => {
     setBusy(true);
     setError("");
     try {
-      setSession({ mode: "wallet", address: await connectWallet() });
+      const choices = await availableWallets();
+      if (!selected && ((changeWallet && choices.length > 0) || (choices.length > 1 && !choices.some(choice => choice.id === preferredWalletId())))) {
+        setWalletChoices(choices);
+        return;
+      }
+      setSession({ mode: "wallet", address: await connectWallet(selected) });
+      setWalletChoices([]);
       setNasAvailable(true);
       setPage("我的 NAS");
     } catch (e) {
@@ -168,6 +199,7 @@ function App() {
     }
   };
   const nasConnected = session?.mode === "wallet" && nasAvailable;
+  if (restoring) return <div className="login-page"><header className="login-header"><Brand /></header><main className="login-main"><section className="login-card"><p role="status">Restoring your session…</p></section></main></div>;
   if (!session)
     return (
       <div className="login-page">
@@ -236,13 +268,20 @@ function App() {
             </div>
             <button
               className="button primary connect"
-              onClick={connect}
+              onClick={() => void connect()}
               disabled={busy}
             >
               <Wallet size={19} />
               {busy ? "Confirm in your wallet…" : "Connect wallet"}
               <ArrowRight size={18} />
             </button>
+            {walletChoices.length > 0 && <div className="wallet-choices" role="group" aria-label="Choose a wallet">
+              <p>Choose a wallet. Your selection will be remembered.</p>
+              {walletChoices.map(choice => <button key={choice.id} className="button demo" disabled={busy} onClick={() => void connect(choice)}>{choice.name}</button>)}
+              <button className="button demo" disabled={busy} onClick={() => setWalletChoices([])}>Cancel</button>
+            </div>}
+            <button className="button demo" disabled={busy} onClick={() => void connect(undefined, true)}>Choose another wallet</button>
+            {restoreFailed && <button className="button demo" onClick={() => void retryRestore()}>Retry session connection</button>}
             {error && (
               <p role="alert" className="error">
                 {error}
@@ -286,7 +325,7 @@ function App() {
         p.author === page) &&
       `${p.title}${p.author}${p.description}`.includes(query),
   );
-  const feedPage = !["我的 NAS", "我的发布", "个人资料"].includes(page);
+  const feedPage = !["我的 NAS", "我的发布", "个人资料", "消息通知"].includes(page);
   return (
     <div className="app-shell">
       <header className="app-header">
@@ -347,12 +386,14 @@ function App() {
           {[
             { name: "关注动态", Icon: Home },
             { name: "我的关注", Icon: Users },
+            { name: "消息通知", Icon: Bell },
             { name: "我的收藏", Icon: Bookmark },
             { name: "我的发布", Icon: Play },
           ].map(({ name, Icon }) => (
             <button
               key={name}
               className={`nav-item ${page === name ? "active" : ""}`}
+              aria-current={page === name ? "page" : undefined}
               onClick={() => navigate(name)}
             >
               <Icon size={19} />
@@ -445,14 +486,22 @@ function App() {
                 ? "来自你关注的人，按时间自然发生。"
                 : page === "我的收藏"
                   ? "Save moments to revisit. Bookmarks are kept for this session only."
-                  : page === "我的 NAS"
-                    ? "连接自己的设备，让数据回到自己的手中。"
-                    : "你的选择，构成你的内容世界。"}
+                  : page === "消息通知"
+                    ? "Notifications are coming soon."
+                    : page === "我的 NAS"
+                      ? "连接自己的设备，让数据回到自己的手中。"
+                      : "你的选择，构成你的内容世界。"}
             </p>
           </div>
           <span className="date-label">RED LEAVES / YOUR SPACE</span>
         </div>
-        {session.mode === "wallet" && session.address && page === "个人资料" ? (
+        {page === "消息通知" ? (
+          <section className="empty-state" aria-labelledby="notifications-title">
+            <Bell size={42} aria-hidden="true" />
+            <h2 id="notifications-title">Notifications are coming soon</h2>
+            <p>Follow alerts and other notifications will appear here when this feature is available.</p>
+          </section>
+        ) : session.mode === "wallet" && session.address && page === "个人资料" ? (
           <React.Suspense fallback={<p role="status">Loading profile…</p>}><Profile key={session.address} owner={session.address} /></React.Suspense>
         ) : session.mode === "wallet" && session.address && ["关注动态", "我的发布", "我的关注"].includes(page) ? (
           <React.Suspense fallback={<p role="status">Loading content…</p>}><Publishing key={`${session.address}:${page}`} owner={session.address} page={page === "我的发布" ? "publish" : page === "我的关注" ? "relationships" : "feed"} /></React.Suspense>

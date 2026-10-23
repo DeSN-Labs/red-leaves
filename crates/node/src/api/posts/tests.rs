@@ -6,19 +6,12 @@ use axum::{
     http::Request,
 };
 use k256::ecdsa::SigningKey;
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Mutex,
-};
+use std::collections::HashMap;
 use tower::ServiceExt;
 
-type PaidKey = (Address, [u8; 32], Address);
-type Listings = HashMap<(Address, [u8; 32]), (u128, Vec<u8>)>;
 #[derive(Default)]
 struct RpcState {
     profiles: HashMap<Address, (String, Vec<u8>)>,
-    listings: Mutex<Listings>,
-    paid: Mutex<HashSet<PaidKey>>,
 }
 async fn rpc(State(state): State<Arc<RpcState>>, Json(input): Json<Value>) -> Json<Value> {
     let result = match input["method"].as_str().unwrap() {
@@ -35,24 +28,8 @@ async fn rpc(State(state): State<Arc<RpcState>>, Json(input): Json<Value>) -> Js
                     encryptionPublicKey: key.clone().into(),
                     nickname: "User".into(),
                 })
-            } else if data.starts_with(&getPostCall::SELECTOR) {
-                let call = getPostCall::abi_decode(&data).unwrap();
-                let owner = Address(call.owner.into_array());
-                let id = call.postId.0;
-                let listings = state.listings.lock().unwrap();
-                let (price, key) = listings.get(&(owner, id)).cloned().unwrap_or_default();
-                getPostCall::abi_encode_returns(&getPostReturn {
-                    author: if price == 0 { [0; 20] } else { owner.0 }.into(),
-                    price,
-                    encryptedKey: key.into(),
-                })
             } else {
-                let call = purchasedCall::abi_decode(&data).unwrap();
-                purchasedCall::abi_encode_returns(&state.paid.lock().unwrap().contains(&(
-                    Address(call.owner.into_array()),
-                    call.postId.0,
-                    Address(call.buyer.into_array()),
-                )))
+                panic!("Unexpected contract call");
             };
             json!(format!("0x{}", hex::encode(result)))
         }
@@ -96,10 +73,7 @@ async fn setup() -> Setup {
         profiles.insert(address, (peer.clone(), keys.pair(&owner).unwrap().1));
         actors.push((key, owner, token));
     }
-    let rpc_state = Arc::new(RpcState {
-        profiles,
-        ..Default::default()
-    });
+    let rpc_state = Arc::new(RpcState { profiles });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let rpc_url = format!("http://{}", listener.local_addr().unwrap());
     let rpc_app = Router::new()
@@ -111,7 +85,7 @@ async fn setup() -> Setup {
     let service = Arc::new(Service {
         runtime: Default::default(),
         keys,
-        chain: Some(Chain::new(rpc_url, Address([7; 20]), Some(Address([8; 20]))).unwrap()),
+        chain: Some(Chain::new(rpc_url, Address([7; 20])).unwrap()),
         objects: root.join("objects"),
     });
     let app = super::super::router(
@@ -172,13 +146,12 @@ async fn prepare_signed(setup: &Setup, actor: usize, action: Action) -> Value {
         .unwrap();
     json!({"payload":prepared["payload"],"signature":format!("0x{}{}",hex::encode(signature.to_bytes()),hex::encode([recovery.to_byte()+27]))})
 }
-fn draft(setup: &Setup, directed: bool, paid: bool) -> Action {
+fn draft(setup: &Setup, directed: bool) -> Action {
     Action::Publish {
         post: red_leaves_protocol::social::PostDraft {
             title: "Test post".into(),
             media: vec![],
             body: "Private content that must not leak".repeat(150),
-            price_wei: if paid { "100" } else { "0" }.into(),
             distribution: if directed {
                 Distribution::Directed
             } else {
@@ -192,8 +165,8 @@ fn draft(setup: &Setup, directed: bool, paid: bool) -> Action {
         },
     }
 }
-async fn publish(setup: &Setup, directed: bool, paid: bool) -> Value {
-    let proof = prepare_signed(setup, 0, draft(setup, directed, paid)).await;
+async fn publish(setup: &Setup, directed: bool) -> Value {
+    let proof = prepare_signed(setup, 0, draft(setup, directed)).await;
     let (status, value) = call(setup, 0, "POST", "/api/social/commit", proof).await;
     assert_eq!(status, StatusCode::OK, "{value}");
     value
@@ -218,7 +191,7 @@ async fn feed(setup: &Setup, actor: usize) -> Value {
 #[tokio::test]
 async fn signed_confirmation_is_required_and_commits_are_idempotent() {
     let setup = setup().await;
-    let proof = prepare_signed(&setup, 0, draft(&setup, false, false)).await;
+    let proof = prepare_signed(&setup, 0, draft(&setup, false)).await;
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM social_posts")
         .fetch_one(&setup.pool)
         .await
@@ -249,7 +222,7 @@ async fn signed_confirmation_is_required_and_commits_are_idempotent() {
 #[tokio::test]
 async fn directed_content_is_encrypted_and_unrelated_users_cannot_read() {
     let setup = setup().await;
-    let result = publish(&setup, true, false).await;
+    let result = publish(&setup, true).await;
     let id = result["id"].as_str().unwrap();
     let path: String = sqlx::query_scalar("SELECT object_path FROM social_posts WHERE id=?")
         .bind(id)
@@ -284,7 +257,7 @@ async fn directed_content_is_encrypted_and_unrelated_users_cannot_read() {
 #[tokio::test]
 async fn reception_categories_use_real_follow_edges_without_expanding_audience() {
     let setup = setup().await;
-    publish(&setup, false, false).await;
+    publish(&setup, false).await;
     assert!(
         feed(&setup, 1).await["posts"]
             .as_array()
@@ -307,117 +280,69 @@ async fn reception_categories_use_real_follow_edges_without_expanding_audience()
     assert_eq!(feed(&setup, 1).await["posts"].as_array().unwrap().len(), 1);
     prefs(&setup, 0, false, false, true, false).await;
     // Viewer 0 receives broadcasts by their follower 1, not arbitrary authors.
-    let proof = prepare_signed(&setup, 1, draft(&setup, false, false)).await;
+    let proof = prepare_signed(&setup, 1, draft(&setup, false)).await;
     assert_eq!(
         call(&setup, 1, "POST", "/api/social/commit", proof).await.0,
         StatusCode::OK
     );
     assert_eq!(feed(&setup, 0).await["posts"].as_array().unwrap().len(), 1);
     prefs(&setup, 2, true, true, true, true).await;
-    publish(&setup, true, false).await;
+    publish(&setup, true).await;
     assert_eq!(feed(&setup, 2).await["posts"].as_array().unwrap().len(), 2);
 }
 #[tokio::test]
-async fn paid_posts_require_matching_listing_and_payment_before_plaintext_or_key_release() {
+async fn publication_has_no_pricing_and_obsolete_routes_are_removed() {
     let setup = setup().await;
-    let result = publish(&setup, true, true).await;
-    let id = result["id"].as_str().unwrap();
-    assert_eq!(result["status"], "awaiting_listing");
-    assert_eq!(
-        call(&setup, 1, "GET", &format!("/api/posts/{id}"), Value::Null)
+    for price in ["0", "100"] {
+        let mut action = serde_json::to_value(draft(&setup, false)).unwrap();
+        action["post"]["price_wei"] = json!(price);
+        assert_eq!(
+            call(
+                &setup,
+                0,
+                "POST",
+                "/api/social/prepare",
+                json!({"action":action})
+            )
             .await
             .0,
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(
-        call(
-            &setup,
-            0,
-            "POST",
-            &format!("/api/posts/{id}/activate"),
-            json!({})
-        )
-        .await
-        .0,
-        StatusCode::CONFLICT
-    );
-    let author = address(&setup.actors[0].1).unwrap();
-    let buyer = address(&setup.actors[1].1).unwrap();
-    let digest = digest_id(id).unwrap();
-    setup.rpc.listings.lock().unwrap().insert(
-        (author, digest),
-        (
-            100,
-            bytes(result["encrypted_key"].as_str().unwrap()).unwrap(),
-        ),
-    );
-    assert_eq!(
-        call(
-            &setup,
-            0,
-            "POST",
-            &format!("/api/posts/{id}/activate"),
-            json!({})
-        )
-        .await
-        .0,
-        StatusCode::OK
-    );
-    let (_, locked) = call(&setup, 1, "GET", &format!("/api/posts/{id}"), Value::Null).await;
-    assert_eq!(locked["locked"], true);
-    assert!(locked.get("intent").is_none());
-    assert!(locked.get("paid_key_envelope").is_none());
-    assert_eq!(
-        call(
-            &setup,
-            1,
-            "POST",
-            &format!("/api/posts/{id}/unlock"),
-            json!({})
-        )
-        .await
-        .0,
-        StatusCode::PAYMENT_REQUIRED
-    );
-    setup
-        .rpc
-        .paid
-        .lock()
-        .unwrap()
-        .insert((author, digest, buyer));
-    let (status, unlocked) = call(
-        &setup,
-        1,
-        "POST",
-        &format!("/api/posts/{id}/unlock"),
-        json!({}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{unlocked}");
-    assert_eq!(unlocked["locked"], false);
-    let envelope: KeyEnvelope =
-        serde_json::from_value(unlocked["paid_key_envelope"].clone()).unwrap();
-    let (secret, _) = setup.service.keys.pair(&setup.actors[1].1).unwrap();
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+    let result = publish(&setup, true).await;
+    assert_eq!(result["status"], "saved_pending_network");
     assert!(
-        encryption::unwrap(
-            &secret,
-            &envelope,
-            format!("red-leaves/post/1/{id}/paid/{}", setup.actors[1].1).as_bytes()
-        )
-        .is_ok()
+        result.get("price_wei").is_none()
+            && result.get("market").is_none()
+            && result.get("encrypted_key").is_none()
     );
-    assert_eq!(
-        call(
-            &setup,
-            2,
-            "POST",
-            &format!("/api/posts/{id}/unlock"),
-            json!({})
-        )
-        .await
-        .0,
-        StatusCode::NOT_FOUND
-    );
+    let id = result["id"].as_str().unwrap();
+    for (method, route) in [
+        ("GET", "listing"),
+        ("POST", "activate"),
+        ("POST", "unlock"),
+        ("POST", "purchase-info"),
+    ] {
+        assert_eq!(
+            call(
+                &setup,
+                0,
+                method,
+                &format!("/api/posts/{id}/{route}"),
+                json!({})
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+    let (status, read) = call(&setup, 1, "GET", &format!("/api/posts/{id}"), Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(read.get("locked").is_none() && read.get("paid_key_envelope").is_none());
+    assert!(read["intent"]["action"]["post"].get("price_wei").is_none());
+    let posts = feed(&setup, 1).await;
+    assert!(posts["posts"][0].get("price_wei").is_none());
+    assert!(read["signature"].is_string());
 }
 #[tokio::test]
 async fn key_files_survive_restart_and_corruption_never_replaces_keys() {
@@ -445,9 +370,9 @@ async fn lost_master_key_does_not_silently_create_an_unusable_replacement() {
 }
 
 #[tokio::test]
-async fn paid_broadcast_is_ciphertext_and_expired_uncommitted_intents_cannot_publish() {
+async fn broadcast_is_public_and_expired_uncommitted_intents_cannot_publish() {
     let setup = setup().await;
-    let proof = prepare_signed(&setup, 0, draft(&setup, false, false)).await;
+    let proof = prepare_signed(&setup, 0, draft(&setup, false)).await;
     sqlx::query("UPDATE social_challenges SET expires_at=0")
         .execute(&setup.pool)
         .await
@@ -456,14 +381,14 @@ async fn paid_broadcast_is_ciphertext_and_expired_uncommitted_intents_cannot_pub
         call(&setup, 0, "POST", "/api/social/commit", proof).await.0,
         StatusCode::BAD_REQUEST
     );
-    let post = publish(&setup, false, true).await;
+    let post = publish(&setup, false).await;
     let row = sqlx::query("SELECT * FROM social_posts WHERE id=?")
         .bind(post["id"].as_str().unwrap())
         .fetch_one(&setup.pool)
         .await
         .unwrap();
     let object = load_object(&row).unwrap();
-    assert!(object.public_payload.is_none() && object.paid.is_some() && object.transport.is_none());
+    assert!(object.public_payload.is_some() && object.transport.is_none());
     let plaintext =
         decode_content(&setup.service, &row, post["id"].as_str().unwrap(), &object).unwrap();
     let original: Intent = canonical::decode(&plaintext, 32 * 1024).unwrap();
@@ -502,7 +427,7 @@ async fn media_call(
     )
 }
 #[tokio::test]
-async fn media_uploads_are_private_signed_encrypted_and_payment_gated() {
+async fn media_uploads_are_private_signed_encrypted_and_audience_gated() {
     let setup = setup().await;
     // Exceed the JSON route limit to verify that binary uploads use their own bound.
     let image = [b"\x89PNG\r\n\x1a\n".as_slice(), &vec![42; 200_000]].concat();
@@ -553,7 +478,7 @@ async fn media_uploads_are_private_signed_encrypted_and_payment_gated() {
         .await
         .unwrap();
     assert_ne!(std::fs::read(&path).unwrap(), image);
-    let mut action = draft(&setup, true, true);
+    let mut action = draft(&setup, true);
     let Action::Publish { ref mut post } = action else {
         unreachable!()
     };
@@ -582,12 +507,6 @@ async fn media_uploads_are_private_signed_encrypted_and_payment_gated() {
     let id = result["id"].as_str().unwrap();
     let path = format!("/api/posts/{id}/media/{}", file.id);
     assert_eq!(
-        media_call(&setup, 1, "GET", &path, "image/png", vec![])
-            .await
-            .0,
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(
         call(
             &setup,
             0,
@@ -599,41 +518,7 @@ async fn media_uploads_are_private_signed_encrypted_and_payment_gated() {
         .0,
         StatusCode::CONFLICT
     );
-    let author = address(&setup.actors[0].1).unwrap();
-    let buyer = address(&setup.actors[1].1).unwrap();
-    let digest = digest_id(id).unwrap();
-    setup.rpc.listings.lock().unwrap().insert(
-        (author, digest),
-        (
-            100,
-            bytes(result["encrypted_key"].as_str().unwrap()).unwrap(),
-        ),
-    );
-    assert_eq!(
-        call(
-            &setup,
-            0,
-            "POST",
-            &format!("/api/posts/{id}/activate"),
-            json!({})
-        )
-        .await
-        .0,
-        StatusCode::OK
-    );
-    assert_eq!(
-        media_call(&setup, 1, "GET", &path, "image/png", vec![])
-            .await
-            .0,
-        StatusCode::PAYMENT_REQUIRED
-    );
-    assert!(feed(&setup, 1).await["posts"][0]["preview"].is_null());
-    setup
-        .rpc
-        .paid
-        .lock()
-        .unwrap()
-        .insert((author, digest, buyer));
+    assert!(feed(&setup, 1).await["posts"][0]["preview"].is_object());
     assert_eq!(
         media_call(&setup, 1, "GET", &path, "image/png", vec![])
             .await
@@ -646,7 +531,7 @@ async fn media_uploads_are_private_signed_encrypted_and_payment_gated() {
             .0,
         StatusCode::NOT_FOUND
     );
-    // A valid purchase cannot substitute a different upload for the signed reference.
+    // Audience permission cannot substitute a different upload for the signed reference.
     assert_eq!(
         media_call(
             &setup,
@@ -696,7 +581,7 @@ async fn group_scopes_validate_relationships_and_freeze_the_signed_audience() {
         (Distribution::Followers, vec![b, c]),
         (Distribution::Friends, vec![b]),
     ] {
-        let mut action = draft(&setup, true, false);
+        let mut action = draft(&setup, true);
         let Action::Publish { ref mut post } = action else {
             unreachable!()
         };
@@ -720,7 +605,7 @@ async fn group_scopes_validate_relationships_and_freeze_the_signed_audience() {
             }
         );
     }
-    let mut wrong = draft(&setup, true, false);
+    let mut wrong = draft(&setup, true);
     let Action::Publish { ref mut post } = wrong else {
         unreachable!()
     };
@@ -738,7 +623,7 @@ async fn group_scopes_validate_relationships_and_freeze_the_signed_audience() {
         .0,
         StatusCode::CONFLICT
     );
-    let mut action = draft(&setup, true, false);
+    let mut action = draft(&setup, true);
     let Action::Publish { ref mut post } = action else {
         unreachable!()
     };
@@ -774,46 +659,6 @@ async fn group_scopes_validate_relationships_and_freeze_the_signed_audience() {
     );
 }
 #[tokio::test]
-async fn media_migration_upgrades_v2_and_reopens_without_losing_old_posts() {
-    let root = std::env::temp_dir().join(format!(
-        "red-leaves-migrate-{}",
-        identity::secret().unwrap()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
-    let url = format!("sqlite://{}?mode=rwc", root.join("db.sqlite").display());
-    let pool = SqlitePool::connect(&url).await.unwrap();
-    sqlx::raw_sql(include_str!("../../../migrations/0001_auth.sql"))
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::raw_sql(include_str!("../../../migrations/0002_posts.sql"))
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO social_posts VALUES('legacy','author','Old title','0','broadcast',1,1,'path',NULL,NULL)").execute(&pool).await.unwrap();
-    pool.close().await;
-    for _ in 0..2 {
-        let pool = crate::storage::open(&url).await.unwrap();
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("PRAGMA user_version")
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
-            4
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, String>("SELECT title FROM social_posts WHERE id='legacy'")
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
-            "Old title"
-        );
-        pool.close().await;
-    }
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[tokio::test]
 async fn local_delivery_filters_preferences_and_blocks_and_exposes_owner_progress() {
     let setup = setup().await;
     let config = Config {
@@ -824,7 +669,7 @@ async fn local_delivery_filters_preferences_and_blocks_and_exposes_owner_progres
         peer_id: setup.rpc.profiles.values().next().unwrap().0.clone(),
     };
     let task = super::super::start_delivery(setup.pool.clone(), config, None);
-    let result = publish(&setup, true, false).await;
+    let result = publish(&setup, true).await;
     let id = result["id"].as_str().unwrap();
     for _ in 0..40 {
         let count: i64 =
@@ -869,7 +714,7 @@ async fn local_delivery_filters_preferences_and_blocks_and_exposes_owner_progres
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let blocked = publish(&setup, true, false).await;
+    let blocked = publish(&setup, true).await;
     let blocked_id = blocked["id"].as_str().unwrap();
     for _ in 0..40 {
         let (_, value) = call(
@@ -973,5 +818,38 @@ async fn network_requests_cannot_impersonate_a_wallets_registered_nas() {
             .unwrap_err()
             .0,
         StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn post_objects_reject_obsolete_versions_and_removed_fields() {
+    let setup = setup().await;
+    let result = publish(&setup, false).await;
+    let id = result["id"].as_str().unwrap();
+    let path: String = sqlx::query_scalar("SELECT object_path FROM social_posts WHERE id=?")
+        .bind(id)
+        .fetch_one(&setup.pool)
+        .await
+        .unwrap();
+    let original: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut obsolete = original.clone();
+    obsolete["version"] = json!(1);
+    let mut removed = original.clone();
+    removed["paid_key"] = Value::Null;
+    for object in [obsolete, removed] {
+        std::fs::write(&path, serde_json::to_vec(&object).unwrap()).unwrap();
+        assert_eq!(
+            call(&setup, 1, "GET", &format!("/api/posts/{id}"), Value::Null)
+                .await
+                .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+    std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+    assert_eq!(
+        call(&setup, 1, "GET", &format!("/api/posts/{id}"), Value::Null)
+            .await
+            .0,
+        StatusCode::OK
     );
 }

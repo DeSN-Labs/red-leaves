@@ -1,12 +1,12 @@
-//! Bounded application delivery v1. It does not replace the lower-level wire protocol.
+//! Bounded application delivery v2. It does not replace the lower-level wire protocol.
 use crate::{
     Address, ContentId, Error, NetworkScope, Result,
     encryption::{KeyEnvelope, Sealed},
-    social::{Distribution, price},
+    social::Distribution,
 };
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL: &str = "/red-leaves/delivery/1.0.0";
+pub const PROTOCOL: &str = "/red-leaves/delivery/2.0.0";
 pub const CHUNK: usize = 256 * 1024;
 pub const MAX_MESSAGE: usize = 384 * 1024;
 
@@ -18,24 +18,20 @@ pub struct Notice {
     pub author: Address,
     pub source_peer: String,
     pub distribution: Distribution,
-    pub price_wei: String,
-    pub market: Option<Address>,
     pub created_at: u64,
-    /// Only a free broadcast may advertise its title.
+    /// Only a public broadcast may advertise its title.
     pub title: String,
 }
 impl Notice {
     pub fn validate(&self, scope: &NetworkScope, now: u64) -> Result<()> {
         self.scope.ensure_matches(scope)?;
-        let paid = price(&self.price_wei)? > 0;
         if self.author.0 == [0; 20]
             || self.source_peer.len() > 128
             || self.source_peer.parse::<libp2p_identity::PeerId>().is_err()
             || self.created_at == 0
             || self.created_at > now.saturating_add(120)
             || self.title.len() > 256
-            || ((paid || self.distribution != Distribution::Broadcast) && !self.title.is_empty())
-            || (paid != self.market.is_some())
+            || (self.distribution != Distribution::Broadcast && !self.title.is_empty())
         {
             return Err(Error::InvalidMessage);
         }
@@ -86,7 +82,6 @@ pub enum Response {
         sealed: Sealed,
         envelope: KeyEnvelope,
         signature: String,
-        paid_key: Option<KeyEnvelope>,
     },
     Media {
         token: String,

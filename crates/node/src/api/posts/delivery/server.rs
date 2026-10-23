@@ -4,31 +4,6 @@ use std::{
     io::{Read, Seek},
     sync::Mutex,
 };
-async fn source_access(
-    state: &AppState,
-    id: &str,
-    viewer: &str,
-) -> Result<sqlx::sqlite::SqliteRow, ApiError> {
-    let row = load(state, id, viewer).await?;
-    let author: String = row.get("author");
-    if author != viewer && row.get::<String, _>("price_wei") != "0" {
-        let chain = service(state)?.chain.as_ref().ok_or_else(unavailable)?;
-        if row.get::<Option<String>, _>("market") != chain.market.map(wallet) {
-            return Err(unavailable());
-        }
-        if !chain
-            .has_paid(address(&author)?, digest_id(id)?, address(viewer)?)
-            .await
-            .map_err(|_| unavailable())?
-        {
-            return Err(ApiError(
-                StatusCode::PAYMENT_REQUIRED,
-                "Payment has not been confirmed on Base Sepolia",
-            ));
-        }
-    }
-    Ok(row)
-}
 async fn serve_content(
     state: &AppState,
     remote: PeerId,
@@ -38,7 +13,7 @@ async fn serve_content(
     let public = authorize_peer(state, viewer, remote).await?;
     let viewer = wallet(viewer);
     let id = hex::encode(id.as_bytes());
-    let row = source_access(state, &id, &viewer).await?;
+    let row = load(state, &id, &viewer).await?;
     let author: String = row.get("author");
     if profile(state, &author).await?.peer != state.config.peer_id {
         return Err(forbidden());
@@ -49,33 +24,10 @@ async fn serve_content(
     let aad = aad(&id, &viewer);
     let sealed = encryption::seal(&key, &payload, aad.as_bytes()).map_err(|_| unavailable())?;
     let envelope = encryption::wrap(&public, &key, aad.as_bytes()).map_err(|_| unavailable())?;
-    let paid_key = if let Some(envelope) = &stored.paid_key {
-        let (secret, _) = service(state)?
-            .keys
-            .pair(&author)
-            .map_err(|_| unavailable())?;
-        let key = encryption::unwrap(
-            &secret,
-            envelope,
-            format!("red-leaves/post/1/{id}/paid").as_bytes(),
-        )
-        .map_err(|_| unavailable())?;
-        Some(
-            encryption::wrap(
-                &public,
-                &key,
-                format!("red-leaves/post/1/{id}/paid/{viewer}").as_bytes(),
-            )
-            .map_err(|_| unavailable())?,
-        )
-    } else {
-        None
-    };
     Ok(NetResponse::Content {
         sealed,
         envelope,
         signature: stored.signature,
-        paid_key,
     })
 }
 struct MediaGrant {
@@ -111,14 +63,20 @@ impl Server {
         let public = authorize_peer(state, viewer, remote).await?;
         let viewer = wallet(viewer);
         let id = hex::encode(id.as_bytes());
-        let row = source_access(state, &id, &viewer).await?;
+        let row = load(state, &id, &viewer).await?;
         let author: String = row.get("author");
         if profile(state, &author).await?.peer != state.config.peer_id {
             return Err(forbidden());
         }
         let stored = load_object(&row)?;
         let payload = decode_content(service(state)?, &row, &id, &stored)?;
-        let intent: Intent = canonical::decode(&payload, 32 * 1024).map_err(|_| unavailable())?;
+        let intent = red_leaves_protocol::social::verify_post(
+            &payload,
+            &bytes(&stored.signature)?,
+            cid(&id)?,
+            &service(state)?.scope().map_err(|_| unavailable())?,
+        )
+        .map_err(|_| unavailable())?;
         let Action::Publish { post } = intent.action else {
             return Err(bad());
         };

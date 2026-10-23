@@ -203,7 +203,7 @@ pub fn start(
     Error,
 > {
     let topic = gossipsub::IdentTopic::new(format!(
-        "red-leaves/public/1/{}/{}",
+        "red-leaves/public/2/{}/{}",
         scope.chain_id,
         hex::encode(scope.registry_contract.0)
     ));

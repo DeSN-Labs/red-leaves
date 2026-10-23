@@ -5,3 +5,5 @@
 中继与家庭节点可以共用底层代码，但部署角色和管理权限必须分开。
 
 节点默认同时输出控制台和按天轮转的文件日志，支持级别、JSON 格式、目录及保留数量配置，见[日志说明](../docs/logging.md)。容器采集标准错误时可设置 `RED_LEAVES_LOG_FILE=false`。
+
+三台内网服务器的实际推送测试与重跑步骤见[内网 NAS 测试](../docs/lan-delivery-test.md)，配置模板为 [lan/.env.example](lan/.env.example)。脚本按轮次创建独立测试目录，结束后停止节点并保留日志。

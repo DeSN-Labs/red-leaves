@@ -7,9 +7,8 @@ deployment_script="script/DeployUserRegistry.s.sol:DeployUserRegistry"
 broadcast_enabled=false
 for argument in "$@"; do
     case "$argument" in
-        --post-access) deployment_script="script/DeployPostAccess.s.sol:DeployPostAccess" ;;
         --broadcast) broadcast_enabled=true ;;
-        *) echo "Usage: bash script/deploy.sh [--post-access] [--broadcast]" >&2; exit 1 ;;
+        *) echo "Usage: bash script/deploy.sh [--broadcast]" >&2; exit 1 ;;
     esac
 done
 if [[ ! -f .env.profile ]]; then

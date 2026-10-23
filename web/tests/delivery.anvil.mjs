@@ -1,6 +1,7 @@
 // Real libp2p circuits: three temporary NAS processes share one temporary public relay.
 // Uses only Anvil's unlocked development accounts, never user deployment credentials.
 import assert from "node:assert/strict";
+import { lanNodes } from "./lan-nodes.mjs";
 import { spawn } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -13,11 +14,12 @@ import { encodeCanonical, actionsMatch } from "../src/content.ts";
 const root=fileURLToPath(new URL("../../",import.meta.url));
 const directory=await mkdtemp(resolve(tmpdir(),"red-leaves-delivery-"));
 const children=[];
+let lan=null;
 const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function port(){const server=createServer();await new Promise(resolve=>server.listen(0,"127.0.0.1",resolve));const p=server.address().port;await new Promise(resolve=>server.close(resolve));return p;}
 function child(command,args,options={}){const process=spawn(command,args,{stdio:["ignore","pipe","pipe"],...options});process.log="";process.stdout.on("data",d=>process.log+=d.toString());process.stderr.on("data",d=>process.log+=d.toString());children.push(process);return process;}
 async function until(task,label="condition",seconds=45){let last;for(let i=0;i<seconds*5;i++){try{return await task();}catch(error){last=error;await pause(200);}}throw new Error(`${label}: ${last?.message}`);}
-async function stop(process){if(process.exitCode!==null)return;process.kill("SIGTERM");await new Promise(resolve=>process.once("exit",resolve));}
+async function stop(process){if(process.exitCode!==null)return;if(process.stop)await process.stop();else process.kill("SIGTERM");if(process.exitCode===null)await new Promise(resolve=>process.once("exit",resolve));}
 try {
  const rpc=`http://127.0.0.1:${await port()}`;
  child("anvil",["--silent","--chain-id","84532","--port",rpc.split(":").at(-1)]);
@@ -26,11 +28,13 @@ try {
  const addresses=await client.request({method:"eth_accounts"});
  const wallets=addresses.slice(0,4).map(account=>createWalletClient({account,chain:baseSepolia,transport:http(rpc)}));
  async function deploy(name){const artifact=JSON.parse(await readFile(resolve(root,`contracts/out/${name}.sol/${name}.json`),"utf8"));const hash=await wallets[0].deployContract({abi:artifact.abi,bytecode:artifact.bytecode.object});return {address:(await client.waitForTransactionReceipt({hash})).contractAddress,abi:artifact.abi};}
- const registry=await deploy("UserRegistry"),market=await deploy("PostAccess");
+ const registry=await deploy("UserRegistry");
+ lan=await lanNodes(process.argv.find(arg=>arg.startsWith("--lan="))?.slice(6),child,port,rpc);
  async function startNode(name,relay){
+  if(lan)return lan.start(name,relay,registry.address);
   const path=resolve(directory,name);await import("node:fs/promises").then(fs=>fs.mkdir(path,{recursive:true}));
   const api=`http://127.0.0.1:${await port()}`;
-  const env={...process.env,RED_LEAVES_LISTEN:api.slice(7),RED_LEAVES_DATABASE_URL:`sqlite://${resolve(path,"nas.sqlite")}`,RED_LEAVES_AUTH_URI:"http://127.0.0.1:5173",RED_LEAVES_NODE_KEY_PATH:resolve(path,"node.key"),RED_LEAVES_RPC_URL:rpc,RED_LEAVES_USER_REGISTRY_ADDRESS:registry.address,RED_LEAVES_POST_ACCESS_ADDRESS:market.address,RED_LEAVES_CONTENT_PATH:resolve(path,"content"),RED_LEAVES_USER_KEY_PATH:resolve(path,"keys"),RED_LEAVES_MASTER_KEY_PATH:resolve(path,"master.key"),RED_LEAVES_P2P_ENABLED:"true",RED_LEAVES_P2P_LISTEN:"/ip4/127.0.0.1/tcp/0",RED_LEAVES_P2P_RELAYS:relay??"",RED_LEAVES_P2P_PEERS:"",RED_LEAVES_P2P_RELAY_SERVER:relay?"false":"true"};
+  const env={...process.env,RED_LEAVES_LISTEN:api.slice(7),RED_LEAVES_DATABASE_URL:`sqlite://${resolve(path,"nas.sqlite")}`,RED_LEAVES_AUTH_URI:"http://127.0.0.1:5173",RED_LEAVES_NODE_KEY_PATH:resolve(path,"node.key"),RED_LEAVES_RPC_URL:rpc,RED_LEAVES_USER_REGISTRY_ADDRESS:registry.address,RED_LEAVES_CONTENT_PATH:resolve(path,"content"),RED_LEAVES_USER_KEY_PATH:resolve(path,"keys"),RED_LEAVES_MASTER_KEY_PATH:resolve(path,"master.key"),RED_LEAVES_P2P_ENABLED:"true",RED_LEAVES_P2P_LISTEN:"/ip4/127.0.0.1/tcp/0",RED_LEAVES_P2P_RELAYS:relay??"",RED_LEAVES_P2P_PEERS:"",RED_LEAVES_P2P_RELAY_SERVER:relay?"false":"true"};
   const node={api,path,env};
   node.restart=async()=>{node.process=child(resolve(root,"target/debug/red-leaves"),[],{cwd:path,env});await until(async()=>{assert.equal(node.process.exitCode,null,node.process.log);const response=await fetch(`${api}/api/auth/me`);assert.equal(response.status,401);},`start ${name}`);};
   await node.restart();return node;
@@ -38,17 +42,21 @@ try {
  async function request(node,path,body,token=node.token){const response=await fetch(`${node.api}/api/${path}`,{method:body===undefined?"GET":"POST",headers:{"Content-Type":"application/json",...(token?{Authorization:`Bearer ${token}`}:{})},...(body===undefined?{}:{body:JSON.stringify(body)})});return {status:response.status,body:await response.json()};}
  async function login(node,index){const wallet=wallets[index];const challenge=(await request(node,"auth/challenge",{address:wallet.account.address})).body;const signature=await wallet.signMessage({message:challenge.message});const result=await request(node,"auth/verify",{challenge_id:challenge.challenge_id,verifier:challenge.verifier,signature});assert.equal(result.status,200,JSON.stringify(result.body));node.token=result.body.token;node.index=index;node.owner=wallet.account.address.toLowerCase();}
  async function info(node){const response=await request(node,"nas/info");assert.equal(response.status,200);return response.body;}
- const relay=await startNode("relay");await login(relay,3);
- const relayAddress=await until(async()=>{const value=await info(relay);assert(value.p2p_addresses.length);return value.p2p_addresses[0];},"relay address");
+ let relayAddress;
+ if(!lan?.direct){
+  const relay=await startNode("relay");await login(relay,3);
+  relayAddress=await until(async()=>{const value=await info(relay);assert(value.p2p_addresses.length);return lan ? lan.relayAddress(value.peer_id) : value.p2p_addresses[0];},"relay address");
+ }
  const nodes=[];
  for(let i=0;i<3;i++){
   const node=await startNode(`nas-${i}`,relayAddress);await login(node,i);nodes.push(node);
   const nas=await info(node);node.peer=nas.peer_id;
   const key=(await request(node,"content/key")).body;
   const hash=await wallets[i].writeContract({address:registry.address,abi:registry.abi,functionName:"register",args:[nas.peer_id,key.public_key,`User ${i}`]});await client.waitForTransactionReceipt({hash});
-  await until(async()=>assert((await info(node)).p2p_addresses.some(address=>address.includes("p2p-circuit"))),`relay reservation ${i}`);
+  if(!lan?.direct)await until(async()=>assert((await info(node)).p2p_addresses.some(address=>address.includes("p2p-circuit"))),`relay reservation ${i}`);
  }
- console.log("Three NAS nodes reserved relay circuits.");
+ if(lan?.direct)await lan.connect(nodes,stop);
+ console.log(lan?.direct ? "Three NAS nodes configured direct LAN connections." : "Three NAS nodes reserved relay circuits.");
  const [a,b,c]=nodes;
  async function action(node,action){
   const prepared=await request(node,"social/prepare",{action});assert.equal(prepared.status,200,JSON.stringify(prepared.body));const value=prepared.body,intent=value.intent;
@@ -60,7 +68,7 @@ try {
  }
  const walletBytes=node=>Array.from(Buffer.from(node.owner.slice(2),"hex"));
  async function follow(node,target,enabled=true){return action(node,{action:"follow",target:walletBytes(target),enabled});}
- async function publish(distribution="broadcast",targets=[],extra={}){return action(a,{action:"publish",post:{title:`Delivery ${distribution}`,body:"Signed content over a relay circuit",price_wei:"0",distribution,recipients:targets.map(walletBytes),...extra}});}
+ async function publish(distribution="broadcast",targets=[],extra={}){return action(a,{action:"publish",post:{title:`Delivery ${distribution}`,body:"Signed content over a relay circuit",distribution,recipients:targets.map(walletBytes),...extra}});}
  async function feed(node){const response=await request(node,"posts");assert.equal(response.status,200,JSON.stringify(response.body));return response.body.posts;}
  async function has(node,id){assert((await feed(node)).some(post=>post.id===id));}
  async function absent(node,id){assert(!(await feed(node)).some(post=>post.id===id));}
@@ -86,15 +94,12 @@ try {
  console.log("Scope, preference and block filters passed.");
  const image=Buffer.concat([Buffer.from("89504e470d0a1a0a","hex"),Buffer.alloc(300000,42)]);
  const uploadResponse=await fetch(`${a.api}/api/media`,{method:"POST",headers:{"Content-Type":"image/png",Authorization:`Bearer ${a.token}`},body:image});assert.equal(uploadResponse.status,200);const media=await uploadResponse.json();
- const paid=await publish("directed",[b],{body:"",price_wei:"100",media:[media]});
- const digest=`0x${paid.id.slice(4)}`;const hash=await wallets[0].writeContract({address:market.address,abi:market.abi,functionName:"registerPost",args:[digest,100n,paid.encrypted_key]});await client.waitForTransactionReceipt({hash});await client.request({method:"anvil_mine",params:["0x3"]});
- assert.equal((await request(a,`posts/${paid.id}/activate`,{})).status,200);
- await until(()=>has(b,paid.id),"paid notice");assert.equal((await request(b,`posts/${paid.id}`)).body.locked,true);assert.equal((await request(b,`posts/${paid.id}/unlock`,{})).status,402);
- const purchase=await wallets[1].writeContract({address:market.address,abi:market.abi,functionName:"buyPost",args:[a.owner,digest],value:100n});await client.waitForTransactionReceipt({hash:purchase});await client.request({method:"anvil_mine",params:["0x3"]});
- const unlocked=await request(b,`posts/${paid.id}/unlock`,{});assert.equal(unlocked.status,200,JSON.stringify(unlocked.body));assert(unlocked.body.paid_key_envelope);assert.equal(unlocked.body.intent.action.post.media[0].digest,media.digest);
- const mediaResponse=await fetch(`${b.api}/api/posts/${paid.id}/media/${media.id}`,{headers:{Authorization:`Bearer ${b.token}`}});assert.equal(mediaResponse.status,200,await mediaResponse.clone().text());assert.deepEqual(Buffer.from(await mediaResponse.arrayBuffer()),image);
- assert.equal((await request(c,`posts/${paid.id}/unlock`,{})).status,404);
- console.log("Paid content and encrypted media passed.");
+ const photo=await publish("directed",[b],{body:"",media:[media]});
+ await until(()=>has(b,photo.id),"directed photo");
+ const content=await request(b,`posts/${photo.id}`);assert.equal(content.status,200,JSON.stringify(content.body));assert.equal(content.body.intent.action.post.media[0].digest,media.digest);assert.equal(content.body.intent.action.post.price_wei,undefined);
+ const mediaResponse=await fetch(`${b.api}/api/posts/${photo.id}/media/${media.id}`,{headers:{Authorization:`Bearer ${b.token}`}});assert.equal(mediaResponse.status,200,await mediaResponse.clone().text());assert.deepEqual(Buffer.from(await mediaResponse.arrayBuffer()),image);
+ assert.equal((await request(c,`posts/${photo.id}`)).status,404);
+ console.log("Directed content and encrypted media passed.");
  await stop(b.process);
  const offline=await publish("directed",[b]);
  await until(async()=>{const progress=(await request(a,`posts/${offline.id}/delivery`)).body;assert(progress.targets[0].attempts>0);assert.equal(progress.targets[0].state,"retrying");},"offline retry");
@@ -103,11 +108,13 @@ try {
  await until(async()=>{const progress=(await request(a,`posts/${offline.id}/delivery`)).body;assert.equal(progress.targets[0].state,"delivered");},"receiver save acknowledgment");
  await stop(a.process);
  const cached=await request(b,`posts/${offline.id}`);assert.equal(cached.status,200);assert.equal(cached.body.intent.action.post.body,"Signed content over a relay circuit");
- console.log("Delivery integration passed: relay circuits, all scopes, follow synchronization, live SSE, reception/block filters, paid unlock, encrypted media chunks, offline retry, durable restart and offline cached reading.");
+ console.log(`Delivery integration passed: ${lan?.direct ? "direct LAN connections" : "relay circuits"}, all scopes, follow synchronization, live SSE, reception/block filters, audience isolation, encrypted media chunks, offline retry, durable restart and offline cached reading.`);
+ if(lan)await lan.report();
 } catch(error) {
  for(const process of children){if(process.log) console.error(process.log.slice(-3000));}
  throw error;
 } finally {
- for(const process of children.reverse()){if(process.exitCode===null)process.kill("SIGTERM");}
+ for(const process of children.reverse()){if(process.exitCode===null)await stop(process).catch(error=>console.error(`Unable to stop test process: ${error.message}`));}
+ if(lan)await lan.cleanup();
  await pause(300);await rm(directory,{recursive:true,force:true});
 }

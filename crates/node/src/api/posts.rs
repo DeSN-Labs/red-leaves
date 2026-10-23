@@ -28,10 +28,6 @@ pub(super) fn routes() -> Router<AppState> {
         )
         .route("/api/posts", get(timeline))
         .route("/api/posts/{id}", get(read_post))
-        .route("/api/posts/{id}/activate", post(activate))
-        .route("/api/posts/{id}/listing", get(listing_status))
-        .route("/api/posts/{id}/unlock", post(unlock))
-        .route("/api/posts/{id}/purchase-info", post(purchase_info))
         .route("/api/posts/{id}/delivery", get(live::progress))
         .layer(DefaultBodyLimit::max(128 * 1024))
 }
@@ -122,17 +118,10 @@ async fn prepare(
 ) -> Result<Json<Value>, ApiError> {
     let owner = owner(&state, headers).await?;
     let service = service(&state)?;
-    let chain = service.chain.as_ref().ok_or_else(unavailable)?;
     if let Action::Publish { ref post } = input.action {
         post.validate(address(&owner)?).map_err(|_| bad())?;
         validate_audience(&state, &owner, post).await?;
         media::validate_uploads(&state.pool, &owner, &post.media).await?;
-        if post.price_wei != "0" && chain.market.is_none() {
-            return Err(ApiError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Deploy and configure PostAccess before publishing paid posts",
-            ));
-        }
     }
     let mut issued_at = now() as u64;
     if let Action::Follow { target, .. } = &input.action {
@@ -203,8 +192,6 @@ struct StoredPost {
     public_payload: Option<Vec<u8>>,
     transport: Option<Sealed>,
     transport_keys: Vec<(String, KeyEnvelope)>,
-    paid: Option<Sealed>,
-    paid_key: Option<KeyEnvelope>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -282,39 +269,18 @@ async fn commit(
                 "Register this NAS PeerId and its NAS-held encryption public key before publishing",
             ));
         }
-        let paid = post.price_wei != "0";
-        if paid && chain.market.is_none() {
-            return Err(unavailable());
-        }
         let aad = format!("red-leaves/post/1/{id}");
         let mut stored = StoredPost {
-            version: 1,
+            version: 2,
             signature: input.signature.clone(),
             public_payload: None,
             transport: None,
             transport_keys: vec![],
-            paid: None,
-            paid_key: None,
         };
-        let mut content = Zeroizing::new(payload.to_vec());
-        if paid {
-            let key = encryption::random_key().map_err(|_| unavailable())?;
-            let sealed = encryption::seal(&key, &content, format!("{aad}/paid").as_bytes())
-                .map_err(|_| unavailable())?;
-            stored.paid_key = Some(
-                encryption::wrap(&local_public, &key, format!("{aad}/paid").as_bytes())
-                    .map_err(|_| bad())?,
-            );
-            content =
-                Zeroizing::new(canonical::encode(&sealed, 64 * 1024).map_err(|_| unavailable())?);
-            if post.distribution == Distribution::Broadcast {
-                stored.paid = Some(sealed);
-            }
-        }
         if post.distribution != Distribution::Broadcast {
             let key = encryption::random_key().map_err(|_| unavailable())?;
             stored.transport =
-                Some(encryption::seal(&key, &content, aad.as_bytes()).map_err(|_| unavailable())?);
+                Some(encryption::seal(&key, &payload, aad.as_bytes()).map_err(|_| unavailable())?);
             stored.transport_keys.push((
                 owner.clone(),
                 encryption::wrap(&local_public, &key, format!("{aad}/{owner}").as_bytes())
@@ -352,17 +318,11 @@ async fn commit(
                     .map_err(|_| bad())?,
                 ));
             }
-        } else if !paid {
+        } else {
             stored.public_payload = Some(payload.to_vec());
         }
-        let listing_key = stored
-            .paid_key
-            .as_ref()
-            .map(|key| serde_json::to_string(key).map(|s| format!("0x{}", hex::encode(s))))
-            .transpose()
-            .map_err(|_| unavailable())?;
         let path = write_object(service, &id, &stored).map_err(|_| unavailable())?;
-        post_record = Some((path, listing_key, chain.market));
+        post_record = Some(path);
     }
     let mut tx = state.pool.begin().await?;
     let consumed = sqlx::query(
@@ -411,10 +371,9 @@ async fn commit(
             }
         }
         Action::Publish { post } => {
-            let (path, listing_key, market) = post_record.ok_or_else(unavailable)?;
-            let published = post.price_wei == "0";
-            sqlx::query("INSERT INTO social_posts(id,author,title,price_wei,distribution,created_at,published,object_path,listing_key,market,audience_scope) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
-                .bind(&id).bind(&owner).bind(if post.distribution!=Distribution::Broadcast || !published {"Encrypted post"}else{&post.title}).bind(&post.price_wei).bind(if post.distribution==Distribution::Broadcast {"broadcast"}else{"directed"}).bind(now()).bind(published).bind(path).bind(listing_key).bind(market.map(wallet)).bind(serde_json::to_value(&post.distribution).map_err(|_|bad())?.as_str().ok_or_else(bad)?).execute(&mut *tx).await?;
+            let path = post_record.ok_or_else(unavailable)?;
+            sqlx::query("INSERT INTO social_posts(id,author,title,distribution,created_at,published,object_path,audience_scope) VALUES(?,?,?,?,?,1,?,?)")
+                .bind(&id).bind(&owner).bind(if post.distribution!=Distribution::Broadcast {"Encrypted post"}else{&post.title}).bind(if post.distribution==Distribution::Broadcast {"broadcast"}else{"directed"}).bind(now()).bind(path).bind(serde_json::to_value(&post.distribution).map_err(|_|bad())?.as_str().ok_or_else(bad)?).execute(&mut *tx).await?;
             for (position, file) in post.media.iter().enumerate() {
                 sqlx::query(
                     "INSERT INTO social_post_media(post_id,media_id,position) VALUES(?,?,?)",
@@ -432,9 +391,7 @@ async fn commit(
                     .execute(&mut *tx)
                     .await?;
             }
-            if published {
-                queue(&mut tx, &id, post).await?;
-            }
+            queue(&mut tx, &id, post).await?;
         }
     }
     tx.commit().await?;
@@ -494,27 +451,13 @@ async fn queue(
     Ok(())
 }
 async fn post_status(state: &AppState, id: &str) -> Result<Json<Value>, ApiError> {
-    let row = sqlx::query(
-        "SELECT id,author,price_wei,published,listing_key,market FROM social_posts WHERE id=?",
-    )
-    .bind(id)
-    .fetch_one(&state.pool)
-    .await?;
+    let row = sqlx::query("SELECT author FROM social_posts WHERE id=?")
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await?;
     Ok(Json(
-        json!({"id":id,"status":if row.get::<bool,_>("published"){"saved_pending_network"}else{"awaiting_listing"},"author":row.get::<String,_>("author"),"price_wei":row.get::<String,_>("price_wei"),"encrypted_key":row.get::<Option<String>,_>("listing_key"),"market":row.get::<Option<String>,_>("market")}),
+        json!({"id":id,"status":"saved_pending_network","author":row.get::<String,_>("author")}),
     ))
-}
-async fn listing_status(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    let viewer = owner(&state, headers).await?;
-    let row = load(&state, &id, &viewer).await?;
-    if row.get::<String, _>("author") != viewer {
-        return Err(forbidden());
-    }
-    post_status(&state, &id).await
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -604,7 +547,7 @@ async fn timeline(
     let owner = owner(&state, headers).await?;
     let prefs = get_preferences(&state, &owner).await?;
     let rows=sqlx::query("WITH available AS (
- SELECT p.id,p.author,p.title,p.price_wei,COALESCE(p.audience_scope,p.distribution) AS audience_scope,p.created_at,p.published,0 AS remote
+ SELECT p.id,p.author,p.title,p.audience_scope,p.created_at,p.published,0 AS remote
  FROM social_posts p WHERE
  ((? AND p.author=?) OR (NOT ? AND p.published=1 AND
  (p.distribution='broadcast' OR EXISTS(SELECT 1 FROM social_recipients r WHERE r.post_id=p.id AND r.recipient=?)) AND
@@ -613,7 +556,7 @@ async fn timeline(
  (? AND EXISTS(SELECT 1 FROM social_recipients r WHERE r.post_id=p.id AND r.recipient=?))) AND
  NOT EXISTS(SELECT 1 FROM social_blocks b WHERE b.owner=? AND b.target=p.author)))
  UNION ALL
- SELECT i.post_id,i.author,COALESCE(NULLIF(json_extract(i.notice,'$.title'),''),'Encrypted post'),json_extract(i.notice,'$.price_wei'),json_extract(i.notice,'$.distribution'),i.created_at,1,1
+ SELECT i.post_id,i.author,COALESCE(NULLIF(json_extract(i.notice,'$.title'),''),'Encrypted post'),json_extract(i.notice,'$.distribution'),i.created_at,1,1
  FROM social_inbox i WHERE NOT ? AND i.recipient=? AND i.source_peer!=? AND
  NOT EXISTS(SELECT 1 FROM social_blocks b WHERE b.owner=i.recipient AND b.target=i.author) AND
  ((? AND json_extract(i.notice,'$.distribution')='broadcast') OR
@@ -628,17 +571,13 @@ async fn timeline(
     let mut posts = Vec::new();
     for row in &rows {
         let id: String = row.get("id");
-        let mut preview = None;
-        // Never expose media references, thumbnails or titles before paid unlock.
-        if row.get::<String, _>("price_wei") == "0" || row.get::<String, _>("author") == owner {
-            let readable = if row.get::<bool, _>("remote") {
-                delivery::remote_read(&state, &id, &owner, false).await?
-            } else {
-                let full = load(&state, &id, &owner).await?;
-                readable(&state, &full, &id, None).await?
-            };
-            preview = Some(readable.0["intent"]["action"]["post"].clone());
-        }
+        let content = if row.get::<bool, _>("remote") {
+            delivery::remote_read(&state, &id, &owner).await?
+        } else {
+            let full = load(&state, &id, &owner).await?;
+            readable(&state, &full, &id).await?
+        };
+        let preview = content.0["intent"]["action"]["post"].clone();
         let mut delivery = serde_json::Map::new();
         if query.mine {
             let states = sqlx::query(
@@ -654,7 +593,7 @@ async fn timeline(
                 );
             }
         }
-        posts.push(json!({"id":id,"author":row.get::<String, _>("author"),"title":row.get::<String, _>("title"),"price_wei":row.get::<String, _>("price_wei"),"distribution":row.get::<String, _>("audience_scope"),"created_at":row.get::<i64, _>("created_at"),"published":row.get::<bool, _>("published"),"preview":preview,"delivery":delivery}));
+        posts.push(json!({"id":id,"author":row.get::<String, _>("author"),"title":row.get::<String, _>("title"),"distribution":row.get::<String, _>("audience_scope"),"created_at":row.get::<i64, _>("created_at"),"published":row.get::<bool, _>("published"),"preview":preview,"delivery":delivery}));
     }
     Ok(Json(
         json!({"posts":posts,"scope":"nas_inbox","network_delivery":if service(&state)?.runtime.network().is_some_and(|h|h.status.running.load(std::sync::atomic::Ordering::Relaxed)){"running"}else{"local_only"}}),
@@ -702,11 +641,12 @@ fn load_object(row: &sqlx::sqlite::SqliteRow) -> Result<StoredPost, ApiError> {
     let stored: StoredPost =
         serde_json::from_slice(&std::fs::read(path).map_err(|_| unavailable())?)
             .map_err(|_| unavailable())?;
-    if stored.version != 1 {
+    if stored.version != 2 {
         return Err(unavailable());
     }
     Ok(stored)
 }
+
 fn decode_content(
     service: &crate::posts::Service,
     row: &sqlx::sqlite::SqliteRow,
@@ -716,7 +656,7 @@ fn decode_content(
     let author: String = row.get("author");
     let (secret, _) = service.keys.pair(&author).map_err(|_| unavailable())?;
     let aad = format!("red-leaves/post/1/{id}");
-    let mut bytes = if let Some(transport) = &stored.transport {
+    let bytes = if let Some(transport) = &stored.transport {
         let envelope = &stored
             .transport_keys
             .iter()
@@ -729,25 +669,16 @@ fn decode_content(
     } else if let Some(public) = &stored.public_payload {
         Zeroizing::new(public.clone())
     } else {
-        Zeroizing::new(
-            canonical::encode(stored.paid.as_ref().ok_or_else(unavailable)?, 64 * 1024)
-                .map_err(|_| unavailable())?,
-        )
+        return Err(unavailable());
     };
-    if let Some(envelope) = &stored.paid_key {
-        let key = encryption::unwrap(&secret, envelope, format!("{aad}/paid").as_bytes())
-            .map_err(|_| unavailable())?;
-        let sealed: Sealed = canonical::decode(&bytes, 64 * 1024).map_err(|_| unavailable())?;
-        bytes = encryption::open(&key, &sealed, format!("{aad}/paid").as_bytes())
-            .map_err(|_| unavailable())?;
-    }
-    let intent: Intent = canonical::decode(&bytes, 32 * 1024).map_err(|_| unavailable())?;
-    intent
-        .verify_signature(&self::bytes(&stored.signature)?)
-        .map_err(|_| unavailable())?;
-    if hex::encode(intent.id().map_err(|_| unavailable())?.as_bytes()) != id
-        || wallet(intent.actor) != author
-    {
+    let intent = red_leaves_protocol::social::verify_post(
+        &bytes,
+        &self::bytes(&stored.signature)?,
+        ContentId::from_slice(&self::bytes(id)?).map_err(|_| bad())?,
+        &service.scope().map_err(|_| unavailable())?,
+    )
+    .map_err(|_| unavailable())?;
+    if wallet(intent.actor) != author {
         return Err(unavailable());
     }
     intent
@@ -756,58 +687,6 @@ fn decode_content(
         .map_err(|_| unavailable())?;
     Ok(bytes)
 }
-fn digest_id(id: &str) -> Result<[u8; 32], ApiError> {
-    let id = ContentId::from_slice(&bytes(id)?).map_err(|_| bad())?;
-    id.as_bytes()[2..].try_into().map_err(|_| bad())
-}
-async fn activate(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    let owner = owner(&state, headers).await?;
-    let row = load(&state, &id, &owner).await?;
-    if row.get::<String, _>("author") != owner {
-        return Err(forbidden());
-    }
-    if row.get::<bool, _>("published") {
-        return post_status(&state, &id).await;
-    }
-    let service = service(&state)?;
-    let chain = service.chain.as_ref().ok_or_else(unavailable)?;
-    if row.get::<Option<String>, _>("market") != chain.market.map(wallet) {
-        return Err(unavailable());
-    }
-    let (author, price, key) = chain
-        .listing(address(&owner)?, digest_id(&id)?)
-        .await
-        .map_err(|_| unavailable())?;
-    if wallet(author) != owner
-        || price.to_string() != row.get::<String, _>("price_wei")
-        || row.get::<Option<String>, _>("listing_key") != Some(format!("0x{}", hex::encode(key)))
-    {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            "Post listing has not been confirmed or does not match the signed post",
-        ));
-    }
-    let stored = load_object(&row)?;
-    let payload = decode_content(service, &row, &id, &stored)?;
-    let intent: Intent = canonical::decode(&payload, 32 * 1024).map_err(|_| unavailable())?;
-    let Action::Publish { post } = intent.action else {
-        return Err(bad());
-    };
-    let mut tx = state.pool.begin().await?;
-    sqlx::query("UPDATE social_posts SET published=1 WHERE id=?")
-        .bind(&id)
-        .execute(&mut *tx)
-        .await?;
-    queue(&mut tx, &id, &post).await?;
-    tx.commit().await?;
-    service.runtime.changed(&owner);
-    service.runtime.wake.notify_one();
-    post_status(&state, &id).await
-}
 async fn read_post(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -815,122 +694,28 @@ async fn read_post(
 ) -> Result<Json<Value>, ApiError> {
     let viewer = owner(&state, headers).await?;
     if delivery::remote_row(&state, &id, &viewer).await?.is_some() {
-        return delivery::remote_read(&state, &id, &viewer, false).await;
+        return delivery::remote_read(&state, &id, &viewer).await;
     }
     let row = load(&state, &id, &viewer).await?;
-    if row.get::<String, _>("author") != viewer && row.get::<String, _>("price_wei") != "0" {
-        return Ok(Json(
-            json!({"locked":true,"id":id,"title":row.get::<String,_>("title"),"price_wei":row.get::<String,_>("price_wei"),"market":row.get::<Option<String>,_>("market"),"author":row.get::<String,_>("author")}),
-        ));
-    }
-    readable(&state, &row, &id, None).await
-}
-async fn unlock(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    let viewer = owner(&state, headers).await?;
-    if delivery::remote_row(&state, &id, &viewer).await?.is_some() {
-        return delivery::remote_read(&state, &id, &viewer, true).await;
-    }
-    let row = load(&state, &id, &viewer).await?;
-    let service = service(&state)?;
-    let chain = service.chain.as_ref().ok_or_else(unavailable)?;
-    let author: String = row.get("author");
-    if viewer != author
-        && row.get::<String, _>("price_wei") != "0"
-        && (row.get::<Option<String>, _>("market") != chain.market.map(wallet)
-            || !chain
-                .has_paid(address(&author)?, digest_id(&id)?, address(&viewer)?)
-                .await
-                .map_err(|_| unavailable())?)
-    {
-        return Err(ApiError(
-            StatusCode::PAYMENT_REQUIRED,
-            "Payment has not been confirmed on Base Sepolia",
-        ));
-    }
-    readable(&state, &row, &id, Some(&viewer)).await
-}
-async fn purchase_info(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    let buyer = owner(&state, headers).await?;
-    if delivery::remote_row(&state, &id, &buyer).await?.is_some() {
-        return delivery::remote_purchase(&state, &id, &buyer).await;
-    }
-    let row = load(&state, &id, &buyer).await?;
-    let author: String = row.get("author");
-    if author == buyer || row.get::<String, _>("price_wei") == "0" {
-        return Err(bad());
-    }
-    let service = service(&state)?;
-    let chain = service.chain.as_ref().ok_or_else(unavailable)?;
-    let profile = chain.profile(address(&buyer)?).await.map_err(|_| {
-        ApiError(
-            StatusCode::CONFLICT,
-            "Register a valid encryption public key before purchasing content",
-        )
-    })?;
-    encryption::wrap(
-        &profile.public_key,
-        &[0; 32],
-        b"red-leaves/pre-purchase-key-check/1",
-    )
-    .map_err(|_| {
-        ApiError(
-            StatusCode::CONFLICT,
-            "The registered recipient encryption key is invalid",
-        )
-    })?;
-    if chain.market.map(wallet) != row.get::<Option<String>, _>("market") {
-        return Err(unavailable());
-    }
-    let paid = chain
-        .has_paid(address(&author)?, digest_id(&id)?, address(&buyer)?)
-        .await
-        .map_err(|_| unavailable())?;
-    Ok(Json(
-        json!({"paid":paid,"market":row.get::<Option<String>,_>("market"),"price_wei":row.get::<String,_>("price_wei"),"author":author}),
-    ))
+    readable(&state, &row, &id).await
 }
 async fn readable(
     state: &AppState,
     row: &sqlx::sqlite::SqliteRow,
     id: &str,
-    buyer: Option<&str>,
 ) -> Result<Json<Value>, ApiError> {
     let service = service(state)?;
     let stored = load_object(row)?;
     let payload = decode_content(service, row, id, &stored)?;
-    let intent: Intent = canonical::decode(&payload, 32 * 1024).map_err(|_| unavailable())?;
-    let mut envelope = None;
-    if let (Some(buyer), Some(paid)) = (buyer, &stored.paid_key) {
-        let author: String = row.get("author");
-        let (secret, _) = service.keys.pair(&author).map_err(|_| unavailable())?;
-        let aad = format!("red-leaves/post/1/{id}/paid");
-        let key = encryption::unwrap(&secret, paid, aad.as_bytes()).map_err(|_| unavailable())?;
-        let profile = service
-            .chain
-            .as_ref()
-            .ok_or_else(unavailable)?
-            .profile(address(buyer)?)
-            .await
-            .map_err(|_| unavailable())?;
-        envelope = Some(
-            encryption::wrap(
-                &profile.public_key,
-                &key,
-                format!("{aad}/{buyer}").as_bytes(),
-            )
-            .map_err(|_| bad())?,
-        );
-    }
+    let intent = red_leaves_protocol::social::verify_post(
+        &payload,
+        &bytes(&stored.signature)?,
+        ContentId::from_slice(&bytes(id)?).map_err(|_| bad())?,
+        &service.scope().map_err(|_| unavailable())?,
+    )
+    .map_err(|_| unavailable())?;
     Ok(Json(
-        json!({"locked":false,"id":id,"intent":intent,"signature":stored.signature,"paid_key_envelope":envelope}),
+        json!({"id":id,"intent":intent,"signature":stored.signature}),
     ))
 }
 

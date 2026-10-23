@@ -27,7 +27,7 @@ class DeploymentConfigTest(unittest.TestCase):
             )
             mock.chmod(0o700)
             environment = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
-                           "EXPECT_BROADCAST": "1" if broadcast else "0", "EXPECT_SCRIPT": "script/DeployPostAccess.s.sol:DeployPostAccess" if post_access else "script/DeployUserRegistry.s.sol:DeployUserRegistry"}
+                           "EXPECT_BROADCAST": "1" if broadcast else "0", "EXPECT_SCRIPT": "script/DeployUserRegistry.s.sol:DeployUserRegistry"}
             return subprocess.run(
                 ["bash", str(root / "script/deploy.sh"), *(["--post-access"] if post_access else []), *(["--broadcast"] if broadcast else [])],
                 env=environment, capture_output=True, text=True, check=False,
@@ -41,9 +41,10 @@ class DeploymentConfigTest(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn("Mock deployment invoked", result.stdout)
 
-    def test_post_access_script_is_selected_explicitly(self):
+    def test_removed_post_access_flag_is_rejected(self):
         result = self.run_script("0" * 63 + "1", broadcast=True, post_access=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Usage:", result.stderr)
 
     def test_invalid_or_missing_keys_are_rejected(self):
         for key in ("", "a" * 63, "g" * 64, "0x" + "a" * 65):

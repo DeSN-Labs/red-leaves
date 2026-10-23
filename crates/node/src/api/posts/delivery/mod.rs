@@ -16,7 +16,7 @@ fn peer(value: &str) -> Result<PeerId, ApiError> {
     value.parse().map_err(|_| bad())
 }
 fn aad(id: &str, viewer: &str) -> String {
-    format!("red-leaves/delivery/1/{id}/{viewer}")
+    format!("red-leaves/delivery/2/{id}/{viewer}")
 }
 async fn profile(
     state: &AppState,
@@ -92,29 +92,17 @@ async fn notice(state: &AppState, id: &str) -> Result<Notice, ApiError> {
         .fetch_optional(&state.pool)
         .await?
         .ok_or_else(forbidden)?;
-    let distribution: Distribution = serde_json::from_value(json!(
-        row.get::<Option<String>, _>("audience_scope")
-            .unwrap_or(row.get("distribution"))
-    ))
-    .map_err(|_| unavailable())?;
-    let free = row.get::<String, _>("price_wei") == "0";
+    let distribution: Distribution =
+        serde_json::from_value(json!(row.get::<String, _>("audience_scope")))
+            .map_err(|_| unavailable())?;
     Ok(Notice {
         scope: service(state)?.scope().map_err(|_| unavailable())?,
         id: cid(id)?,
         author: address(&row.get::<String, _>("author"))?,
         source_peer: state.config.peer_id.clone(),
         distribution: distribution.clone(),
-        price_wei: row.get("price_wei"),
-        market: if free {
-            None
-        } else {
-            row.get::<Option<String>, _>("market")
-                .as_deref()
-                .map(address)
-                .transpose()?
-        },
         created_at: row.get::<i64, _>("created_at") as u64,
-        title: if free && distribution == Distribution::Broadcast {
+        title: if distribution == Distribution::Broadcast {
             row.get("title")
         } else {
             String::new()
@@ -132,24 +120,6 @@ async fn check_notice(state: &AppState, source: PeerId, notice: &Notice) -> Resu
         return Err(forbidden());
     }
     authorize_peer(state, notice.author, source).await?;
-    if notice.price_wei != "0" {
-        let chain = service(state)?.chain.as_ref().ok_or_else(unavailable)?;
-        if notice.market != chain.market {
-            return Err(forbidden());
-        }
-        let (author, price, _) = chain
-            .listing(
-                notice.author,
-                digest_id(&hex::encode(notice.id.as_bytes()))?,
-            )
-            .await
-            .map_err(|_| unavailable())?;
-        // A paid notice is not a verified plaintext post. The author's confirmed listing
-        // authorizes advertising this ID/price; verify the wallet's full intent on unlock.
-        if author != notice.author || price.to_string() != notice.price_wei {
-            return Err(forbidden());
-        }
-    }
     Ok(())
 }
 fn open_content(
@@ -158,11 +128,38 @@ fn open_content(
     notice: &Notice,
     response: &NetResponse,
 ) -> Result<Intent, ApiError> {
+    let payload = content_payload(state, viewer, notice, response)?;
+    let NetResponse::Content { signature, .. } = response else {
+        return Err(unavailable());
+    };
+    let intent = red_leaves_protocol::social::verify_post(
+        &payload,
+        &bytes(signature)?,
+        notice.id,
+        &notice.scope,
+    )
+    .map_err(|_| forbidden())?;
+    let Action::Publish { post } = &intent.action else {
+        return Err(bad());
+    };
+    if intent.actor != notice.author
+        || intent.nas_peer_id != notice.source_peer
+        || post.distribution != notice.distribution
+        || (post.distribution != Distribution::Broadcast
+            && !post.recipients.contains(&address(viewer)?))
+    {
+        return Err(forbidden());
+    }
+    Ok(intent)
+}
+fn content_payload(
+    state: &AppState,
+    viewer: &str,
+    notice: &Notice,
+    response: &NetResponse,
+) -> Result<Zeroizing<Vec<u8>>, ApiError> {
     let NetResponse::Content {
-        sealed,
-        envelope,
-        signature,
-        ..
+        sealed, envelope, ..
     } = response
     else {
         return Err(unavailable());
@@ -172,31 +169,9 @@ fn open_content(
         .pair(viewer)
         .map_err(|_| unavailable())?;
     let id = hex::encode(notice.id.as_bytes());
-    let aad = aad(&id, viewer);
-    let key = encryption::unwrap(&secret, envelope, aad.as_bytes()).map_err(|_| forbidden())?;
-    let payload = encryption::open(&key, sealed, aad.as_bytes()).map_err(|_| forbidden())?;
-    let intent: Intent = canonical::decode(&payload, 32 * 1024).map_err(|_| bad())?;
-    intent
-        .verify_signature(&bytes(signature)?)
-        .map_err(|_| forbidden())?;
-    intent
-        .scope
-        .ensure_matches(&notice.scope)
-        .map_err(|_| forbidden())?;
-    let Action::Publish { post } = &intent.action else {
-        return Err(bad());
-    };
-    if intent.id().map_err(|_| bad())? != notice.id
-        || intent.actor != notice.author
-        || intent.nas_peer_id != notice.source_peer
-        || post.price_wei != notice.price_wei
-        || post.distribution != notice.distribution
-        || (post.distribution != Distribution::Broadcast
-            && !post.recipients.contains(&address(viewer)?))
-    {
-        return Err(forbidden());
-    }
-    Ok(intent)
+    let context = aad(&id, viewer);
+    let key = encryption::unwrap(&secret, envelope, context.as_bytes()).map_err(|_| forbidden())?;
+    encryption::open(&key, sealed, context.as_bytes()).map_err(|_| forbidden())
 }
 async fn save_inbox(
     state: &AppState,
@@ -267,28 +242,18 @@ async fn receive(
             body: row.get::<Option<String>, _>("object_path").is_some(),
         });
     }
-    let object = if notice.price_wei == "0" {
-        let response = network(state)?
-            .request(
-                source,
-                NetRequest::Fetch {
-                    id: notice.id,
-                    viewer: address(viewer)?,
-                },
-            )
-            .await
-            .map_err(|_| unavailable())?;
-        let intent = open_content(state, viewer, notice, &response)?;
-        if let Action::Publish { post } = &intent.action
-            && post.distribution != Distribution::Broadcast
-            && !post.recipients.contains(&address(viewer)?)
-        {
-            return Err(forbidden());
-        }
-        Some(write_object(service(state)?, &id, &response).map_err(|_| unavailable())?)
-    } else {
-        None
-    };
+    let response = network(state)?
+        .request(
+            source,
+            NetRequest::Fetch {
+                id: notice.id,
+                viewer: address(viewer)?,
+            },
+        )
+        .await
+        .map_err(|_| unavailable())?;
+    open_content(state, viewer, notice, &response)?;
+    let object = Some(write_object(service(state)?, &id, &response).map_err(|_| unavailable())?);
     // Preferences can change while an RPC or content fetch is in flight.
     if !eligible(
         state,
@@ -338,29 +303,9 @@ pub(super) async fn remote_read(
     state: &AppState,
     id: &str,
     viewer: &str,
-    unlock: bool,
 ) -> Result<Json<Value>, ApiError> {
     let row = remote_row(state, id, viewer).await?.ok_or_else(forbidden)?;
     let notice = row_notice(&row)?;
-    if notice.price_wei != "0" && !unlock {
-        return Ok(Json(
-            json!({"locked":true,"id":id,"title":"Encrypted post","price_wei":notice.price_wei,"market":notice.market.map(wallet),"author":wallet(notice.author)}),
-        ));
-    }
-    if unlock && notice.price_wei != "0" {
-        let chain = service(state)?.chain.as_ref().ok_or_else(unavailable)?;
-        if notice.market != chain.market
-            || !chain
-                .has_paid(notice.author, digest_id(id)?, address(viewer)?)
-                .await
-                .map_err(|_| unavailable())?
-        {
-            return Err(ApiError(
-                StatusCode::PAYMENT_REQUIRED,
-                "Payment has not been confirmed on Base Sepolia",
-            ));
-        }
-    }
     let (intent, response) = if row.get::<Option<String>, _>("object_path").is_some() {
         cached_content(state, viewer, &row)?
     } else {
@@ -379,43 +324,10 @@ pub(super) async fn remote_read(
         save_inbox(state, viewer, &notice, Some(path)).await?;
         (intent, response)
     };
-    let NetResponse::Content {
-        signature,
-        paid_key,
-        ..
-    } = response
-    else {
+    let NetResponse::Content { signature, .. } = response else {
         return Err(unavailable());
     };
-    Ok(Json(
-        json!({"locked":false,"id":id,"intent":intent,"signature":signature,"paid_key_envelope":paid_key}),
-    ))
-}
-pub(super) async fn remote_purchase(
-    state: &AppState,
-    id: &str,
-    viewer: &str,
-) -> Result<Json<Value>, ApiError> {
-    let row = remote_row(state, id, viewer).await?.ok_or_else(forbidden)?;
-    let notice = row_notice(&row)?;
-    let chain = service(state)?.chain.as_ref().ok_or_else(unavailable)?;
-    if notice.price_wei == "0" || notice.market != chain.market {
-        return Err(bad());
-    }
-    let own = profile(state, viewer).await?;
-    encryption::wrap(
-        &own.public_key,
-        &[0; 32],
-        b"red-leaves/pre-purchase-key-check/1",
-    )
-    .map_err(|_| bad())?;
-    let paid = chain
-        .has_paid(notice.author, digest_id(id)?, address(viewer)?)
-        .await
-        .map_err(|_| unavailable())?;
-    Ok(Json(
-        json!({"paid":paid,"market":notice.market.map(wallet),"price_wei":notice.price_wei,"author":wallet(notice.author)}),
-    ))
+    Ok(Json(json!({"id":id,"intent":intent,"signature":signature})))
 }
 
 pub(super) async fn remote_media(
@@ -424,7 +336,7 @@ pub(super) async fn remote_media(
     viewer: &str,
     media_id: &str,
 ) -> Result<Response, ApiError> {
-    let readable = remote_read(state, post_id, viewer, true).await?;
+    let readable = remote_read(state, post_id, viewer).await?;
     let intent: Intent =
         serde_json::from_value(readable.0["intent"].clone()).map_err(|_| unavailable())?;
     let Action::Publish { post } = &intent.action else {

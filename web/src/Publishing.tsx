@@ -1,12 +1,11 @@
 import React, { useEffect, useRef, useState } from "react";
-import { formatEther } from "viem";
-import { ImagePlus, Video, FileText, X, LockKeyhole, ChevronLeft, ChevronRight } from "lucide-react";
+import { ImagePlus, Video, FileText, X, ChevronLeft, ChevronRight } from "lucide-react";
 import { nasApi, nasBlob, nasUpload, shortAddress, watchNasChanges } from "./wallet";
-import { addressBytes, audienceWallets, priceEthToWei, submitAction, listPaidPost, buyPost, type Draft, type Distribution, type Media, type Relationships, type PostSummary, type PostDetail, type PostStatus, type Preferences } from "./content";
+import { addressBytes, audienceWallets, submitAction, type Draft, type Distribution, type Media, type Relationships, type PostSummary, type PostDetail, type Preferences } from "./content";
 
 const scopes: Record<Distribution, string> = { broadcast: "Network broadcast", following: "People I follow", followers: "People who follow me", friends: "Friends (mutual follows)", directed: "Specific people" };
 
-// Fetch with the Bearer session; object URLs are revoked when the view or session changes.
+// Fetch with the HttpOnly cookie session; object URLs are revoked when the view or session changes.
 function MediaView({ file, path, controls = false }: { file: Media; path: string; controls?: boolean }) {
   const [url, setUrl] = useState(""), [error, setError] = useState("");
   const container = useRef<HTMLDivElement>(null);
@@ -21,7 +20,7 @@ function MediaView({ file, path, controls = false }: { file: Media; path: string
   }, [path]);
   return <div className="media-view" ref={container}>{error ? <p className="media-error" role="alert">{error}</p> : !url ? <span className="media-loading" role="status">Loading media…</span> : file.mime.startsWith("video/") ? <video src={url} controls={controls} preload="metadata" playsInline aria-label="Post video" /> : <img src={url} alt="Post attachment" loading="lazy" />}</div>;
 }
-function Detail({ post, value, busy, error, close, unlock }: { post: PostSummary; value: PostDetail; busy: boolean; error: string; close: () => void; unlock: (purchase: boolean) => void }) {
+function Detail({ post, value, error, close }: { post: PostSummary; value: PostDetail; error: string; close: () => void }) {
   const dialog = useRef<HTMLDialogElement>(null), [index, setIndex] = useState(0);
   const draft = value.intent?.action.post, files = draft?.media ?? [];
   useEffect(() => { const node = dialog.current; node?.showModal(); return () => { node?.close(); }; }, []);
@@ -34,7 +33,6 @@ function Detail({ post, value, busy, error, close, unlock }: { post: PostSummary
       <div className="note-copy"><p className="note-author">{shortAddress(post.author)}</p><span className="registration-badge">{scopes[post.distribution as Distribution] ?? post.distribution}</span><h2>{draft?.title ?? post.title}</h2>
         {error && <p className="error" role="alert">{error}</p>}
         {draft && <p className="post-body">{draft.body}</p>}
-        {value.locked && <div className="locked-post"><LockKeyhole size={30} /><h3>Unlock this post</h3><p>The content and media are available after confirmed payment.</p><button className="button primary" disabled={busy} onClick={() => unlock(true)}>{busy ? "Processing…" : `Pay ${formatEther(BigInt(post.price_wei))} test ETH & unlock`}</button><button className="button demo" disabled={busy} onClick={() => unlock(false)}>Check existing payment</button></div>}
         <time>{new Date(post.created_at * 1000).toLocaleString()}</time>
       </div>
     </div>
@@ -44,7 +42,6 @@ export function Publishing({ owner, page }: { owner: string; page: "publish" | "
   const [title, setTitle] = useState(""), [body, setBody] = useState("");
   const [mode, setMode] = useState<"text" | "images" | "video">("text"), [media, setMedia] = useState<Media[]>([]);
   const [pending, setPending] = useState<Media[]>([]);
-  const [paid, setPaid] = useState(false), [price, setPrice] = useState("0.001");
   const [distribution, setDistribution] = useState<Distribution>("broadcast");
   const [recipients, setRecipients] = useState(""), [selectedPeople, setSelectedPeople] = useState<string[]>([]), [peopleTab, setPeopleTab] = useState<"friends" | "following">("friends");
   const [confirmed, setConfirmed] = useState(false);
@@ -112,28 +109,18 @@ export function Publishing({ owner, page }: { owner: string; page: "publish" | "
     setMessage("Media saved privately. Sign and confirm the post to publish it.");
   }
   async function publish() {
-    if (!confirmed) throw new Error("Confirm the content, price and recipients before publishing.");
+    if (!confirmed) throw new Error("Confirm the content and recipients before publishing.");
     if (!title.trim() || new TextEncoder().encode(title).length > 256) throw new Error("Title must contain 1 to 256 UTF-8 bytes.");
     if ((!body.trim() && !media.length) || new TextEncoder().encode(body).length > 16384) throw new Error("Add text or media. Text must be within 16384 UTF-8 bytes.");
     if (mode !== "text" && !media.length) throw new Error("Upload media for the selected post format.");
     if (distribution !== "broadcast" && (!audience.length || audience.length > 32)) throw new Error("Choose 1 to 32 recipients. Narrow a larger audience using Specific people.");
-    const draft: Draft = { title, body, distribution, price_wei: paid ? priceEthToWei(price) : "0", recipients: audience.map(addressBytes), ...(media.length ? { media } : {}) };
+    const draft: Draft = { title, body, distribution, recipients: audience.map(addressBytes), ...(media.length ? { media } : {}) };
     setMessage("Confirm the publication signature in your wallet.");
-    const result = await submitAction(owner, { action: "publish", post: draft });
-    // The signed post now owns its uploads, even if the separate paid listing is interrupted.
+    await submitAction(owner, { action: "publish", post: draft });
     setTitle(""); setBody(""); setMedia([]); setConfirmed(false);
-    if (result.status === "awaiting_listing") {
-      setMessage("Post saved privately. Confirm the paid listing transaction in your wallet.");
-      await listPaidPost(owner, result);
-    }
     setMessage("Publication confirmed. Delivery continues in the background, including retries for offline recipients.");
   }
   async function read(post: PostSummary) { const value = await nasApi<PostDetail>(`posts/${post.id}`); setDetail(value); setSelected(post); }
-  async function unlock(post: PostSummary, purchase: boolean) {
-    const value = purchase && detail?.market ? await buyPost(owner, post, detail.market) : await nasApi<PostDetail>(`posts/${post.id}/unlock`, {});
-    setDetail(value);
-    if (value.intent) setItems(previous => previous.map(item => item.id === post.id ? { ...item, preview: value.intent!.action.post } : item));
-  }
   return <div className="publishing">
     {error && <p className="error" role="alert">{error}</p>}{message && <p role="status">{message}</p>}
     <p className="muted">{networkStatus === "running" ? "Live NAS inbox · P2P delivery is running. Broadcasts reach connected subscribers." : networkStatus === "local_only" ? "Live NAS inbox · Remote delivery is waiting for P2P connectivity." : "Checking NAS delivery status…"}</p>
@@ -147,7 +134,7 @@ export function Publishing({ owner, page }: { owner: string; page: "publish" | "
         </section>}
         <div className="composer-copy"><label>Title<input required maxLength={200} placeholder="Give your note a title" value={title} disabled={busy} onChange={event => setTitle(event.target.value)} /></label><label>Content {mode !== "text" && <small>(optional)</small>}<textarea required={mode === "text"} rows={8} maxLength={12000} placeholder="Tell your story…" value={body} disabled={busy} onChange={event => setBody(event.target.value)} /></label></div>
       </div>
-      <div className="composer-settings"><label>Post type<select value={paid ? "paid" : "free"} disabled={busy} onChange={event => setPaid(event.target.value === "paid")}><option value="free">Free</option><option value="paid">Paid</option></select></label>{paid && <label>Price (Base Sepolia test ETH)<input type="text" required inputMode="decimal" value={price} disabled={busy} onChange={event => setPrice(event.target.value)} /></label>}
+      <div className="composer-settings">
         <label>Distribution<select value={distribution} disabled={busy} onChange={event => setDistribution(event.target.value as Distribution)}>{Object.entries(scopes).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
       </div>
       {distribution === "directed" && <section className="recipient-picker"><h3>Select recipients</h3><div className="format-tabs"><button type="button" aria-pressed={peopleTab === "friends"} className={peopleTab === "friends" ? "active" : ""} onClick={() => setPeopleTab("friends")}>Friends ({friends.length})</button><button type="button" aria-pressed={peopleTab === "following"} className={peopleTab === "following" ? "active" : ""} onClick={() => setPeopleTab("following")}>Following ({relations.following.length})</button></div>
@@ -155,24 +142,23 @@ export function Publishing({ owner, page }: { owner: string; page: "publish" | "
         <label>Add wallet addresses<textarea rows={2} value={recipients} disabled={busy} onChange={event => setRecipients(event.target.value)} placeholder="0x… separated by commas or new lines" /></label>
       </section>}
       {distribution !== "broadcast" && <details className="audience-review" open><summary>{audience.length} recipient{audience.length === 1 ? "" : "s"} · Review before signing</summary>{!audience.length ? <p>No recipients available for this scope.</p> : audience.map(value => <p key={value} className="key-value">{value}</p>)}<p>Recipients are fixed when you sign. Future relationship changes do not change this post's audience. Maximum 32.</p></details>}
-      <p className="composer-policy">{paid ? "Text and media stay locked until confirmed payment. The author NAS must stay available to deliver content. Listing and purchase transactions expose author, buyer and price. Base Sepolia test ETH only." : distribution === "broadcast" ? "This is a public post. Uploaded files stay private until you sign and confirm publication." : "This post is private to the reviewed recipients. Content is encrypted and media access uses the same audience permissions."}</p>
-      <label className="checkbox-row"><input type="checkbox" checked={confirmed} disabled={busy} onChange={event => { event.stopPropagation(); setConfirmed(event.target.checked); }} />I confirm publication of this content, price and audience. A signature authorizes this publication.</label>
+      <p className="composer-policy">{distribution === "broadcast" ? "This is a public post. Uploaded files stay private until you sign and confirm publication." : "This post is private to the reviewed recipients. Content is encrypted and media access uses the same audience permissions."}</p>
+      <label className="checkbox-row"><input type="checkbox" checked={confirmed} disabled={busy} onChange={event => { event.stopPropagation(); setConfirmed(event.target.checked); }} />I confirm publication of this content and audience. A signature authorizes this publication.</label>
       <button className="button primary" disabled={busy || !confirmed} type="submit">{busy ? "Processing…" : "Sign and publish"}</button>
     </form>}
     {page === "publish" && pending.some(file => !media.some(selected => selected.id === file.id)) && <details className="content-panel"><summary>Unused uploads from earlier drafts</summary><p>Resume an upload or remove it to free storage. These files are visible only to you.</p>{pending.filter(file => !media.some(selected => selected.id === file.id)).map(file => <div className="relationship-row" key={file.id}><span>{file.mime} · {(file.size / 1024 / 1024).toFixed(1)} MiB</span><div className="binding-actions"><button type="button" className="button demo" disabled={busy} onClick={() => { const video = file.mime.startsWith("video/"); if (media.length && (video || media.some(item => item.mime.startsWith("video/")) || media.length >= 9)) { setError("Choose up to 9 images or one video."); return; } setMode(video ? "video" : "images"); setMedia(previous => [...previous, file]); setConfirmed(false); }}>Use in this post</button><button type="button" className="button demo" disabled={busy} onClick={() => void run(async () => { await nasApi(`media/${file.id}/discard`, {}); })}>Remove</button></div></div>)}</details>}
-    {page === "feed" && <details className="content-panel"><summary>Receive posts from</summary>{(Object.keys(prefs) as (keyof Preferences)[]).map(name => <label className="checkbox-row" key={name}><input type="checkbox" checked={prefs[name]} disabled={busy} onChange={event => setPrefs({ ...prefs, [name]: event.target.checked })} />{{ broadcasts: "Network broadcasts", following: "People I follow", followers: "People who follow me", direct: "Posts addressed to me" }[name]}</label>)}<p>Selected sources are combined. Reception does not override audience or payment requirements.</p><button className="button demo" disabled={busy} onClick={() => void run(async () => { await nasApi("social/preferences", prefs); setMessage("Reception preferences saved."); })}>Save reception preferences</button></details>}
+    {page === "feed" && <details className="content-panel"><summary>Receive posts from</summary>{(Object.keys(prefs) as (keyof Preferences)[]).map(name => <label className="checkbox-row" key={name}><input type="checkbox" checked={prefs[name]} disabled={busy} onChange={event => setPrefs({ ...prefs, [name]: event.target.checked })} />{{ broadcasts: "Network broadcasts", following: "People I follow", followers: "People who follow me", direct: "Posts addressed to me" }[name]}</label>)}<p>Selected sources are combined. Reception does not override audience permissions.</p><button className="button demo" disabled={busy} onClick={() => void run(async () => { await nasApi("social/preferences", prefs); setMessage("Reception preferences saved."); })}>Save reception preferences</button></details>}
     {page === "relationships" && <section className="content-panel"><h2>Following and followers</h2><p>Follow changes are signed and synchronized with the target NAS when reachable.</p><label>Wallet address<input value={target} disabled={busy} onChange={event => setTarget(event.target.value)} /></label><button className="button primary" disabled={busy || !target} onClick={() => void run(async () => { await submitAction(owner, { action: "follow", target: addressBytes(target), enabled: true }); setTarget(""); setMessage("Follow confirmed."); })}>Sign and follow</button><h3>Following</h3>{!relations.following.length && <p>No followed wallets yet.</p>}{relations.following.map(value => <div className="relationship-row" key={value}><span>{value}{friends.includes(value) ? " · Friend" : ""}</span><button className="button demo" disabled={busy} onClick={() => void run(async () => { await submitAction(owner, { action: "follow", target: addressBytes(value), enabled: false }); setMessage("Unfollow confirmed."); })}>Unfollow</button></div>)}<h3>Followers</h3>{relations.followers.map(value => <p className="key-value" key={value}>{value}</p>)}<h3>Blocked wallets</h3><p>Blocked authors cannot passively deliver posts to your inbox.</p><button className="button demo" disabled={busy || !target} onClick={() => void run(async () => { addressBytes(target); await nasApi("social/blocks", { target, blocked: true }); setBlocked((await nasApi<{ blocked: string[] }>("social/blocks")).blocked); setTarget(""); setMessage("Wallet blocked."); })}>Block entered wallet</button>{blocked.map(value => <div className="relationship-row" key={value}><span>{value}</span><button className="button demo" disabled={busy} onClick={() => void run(async () => { await nasApi("social/blocks", { target: value, blocked: false }); setBlocked(previous => previous.filter(item => item !== value)); })}>Unblock</button></div>)}</section>}
     {page !== "relationships" && <><div className="binding-actions note-list-heading"><h2>{page === "publish" ? "My notes" : "Latest notes"}</h2><button className="button demo" disabled={busy} onClick={() => void run(async () => {})}>Refresh</button></div>{!items.length && <div className="notes-empty">No posts in this view yet.</div>}
       <div className="notes-grid">{items.map(post => { const preview = post.preview, cover = preview?.media?.[0]; return <article className="note-card" key={post.id}>
         <button className={`note-cover ${cover ? "" : "text-cover"}`} disabled={busy} onClick={() => void run(() => read(post), false)} aria-label={`Open ${preview?.title ?? post.title}`}>
-          {cover ? <MediaView file={cover} path={`posts/${post.id}/media/${cover.id}`} /> : preview ? <div><FileText size={24} /><h3>{preview.title}</h3><p>{preview.body}</p></div> : <div><LockKeyhole size={30} /><span>Paid note</span></div>}
+          {cover ? <MediaView file={cover} path={`posts/${post.id}/media/${cover.id}`} /> : preview ? <div><FileText size={24} /><h3>{preview.title}</h3><p>{preview.body}</p></div> : <div><FileText size={30} /><span>Post preview unavailable</span></div>}
           {cover?.mime.startsWith("video/") && <span className="cover-indicator"><Video size={17} /></span>}{(preview?.media?.length ?? 0) > 1 && <span className="cover-indicator">1 / {preview!.media!.length}</span>}
-        </button><div className="note-card-copy"><span className="note-price">{post.price_wei === "0" ? "Free" : `${formatEther(BigInt(post.price_wei))} test ETH`} · {scopes[post.distribution as Distribution] ?? post.distribution}</span><button className="note-title" disabled={busy} onClick={() => void run(() => read(post), false)}>{preview?.title ?? post.title}</button><div className="note-card-meta"><span>{shortAddress(post.author)}</span><time>{new Date(post.created_at * 1000).toLocaleDateString()}</time></div>
+        </button><div className="note-card-copy"><span className="note-scope">{scopes[post.distribution as Distribution] ?? post.distribution}</span><button className="note-title" disabled={busy} onClick={() => void run(() => read(post), false)}>{preview?.title ?? post.title}</button><div className="note-card-meta"><span>{shortAddress(post.author)}</span><time>{new Date(post.created_at * 1000).toLocaleDateString()}</time></div>
         {page === "publish" && post.published && <div className="delivery-progress"><p>{Object.entries(post.delivery ?? {}).map(([state, count]) => `${state.replaceAll("_", " ")}: ${count}`).join(" · ") || "Preparing delivery…"}</p><button className="button demo" disabled={busy} onClick={() => void run(async () => { const result = await nasApi<{ targets: { target: string; state: string; attempts: number; last_error: string | null }[] }>(`posts/${post.id}/delivery`); setProgress(previous => ({ ...previous, [post.id]: result.targets })); }, false)}>Delivery details</button>{progress[post.id]?.map(item => <p className="key-value" key={item.target}>{item.target === "broadcast" ? "Connected network" : shortAddress(item.target)} · {item.state} · attempts: {item.attempts}{item.last_error ? ` · ${item.last_error}` : ""}</p>)}</div>}
-        {!post.published && <div className="pending-listing"><p>Saved privately · listing pending</p><button className="button demo" disabled={busy} onClick={() => void run(async () => { const status = await nasApi<PostStatus>(`posts/${post.id}/listing`); await listPaidPost(owner, status); setMessage("Paid post is now active."); })}>Complete paid listing</button></div>}
         </div></article>; })}</div>
     </>}
-    {selected && detail && <Detail key={selected.id} post={selected} value={detail} busy={busy} error={error} close={() => { setSelected(null); setDetail(null); }} unlock={purchase => void run(() => unlock(selected, purchase), false)} />}
+    {selected && detail && <Detail key={selected.id} post={selected} value={detail} error={error} close={() => { setSelected(null); setDetail(null); }} />}
   </div>;
 }
 function explain(error: unknown) { return error instanceof Error ? error.message.slice(0, 500) : "The content request failed. Check your NAS and wallet."; }

@@ -9,7 +9,7 @@
 
 依据：[产品需求](product-requirements.md)、[身份与数据交换边界](data-exchange-protocol.md)、[首次绑定 NAS](nas-registration.md)。
 
-实现入口：[crates/protocol](../crates/protocol/README.md)。已实现消息模型、Protobuf 有界帧、确定性 CBOR、Hello 协商、签名中继路由、EOA 公开事件、服务密钥回执及文件清单／块校验；编码细节和参考向量以该库说明及 [Protobuf schema](../crates/protocol/proto/red_leaves.proto) 为首版原型约定。已有单元／内存报文交换测试；节点另通过独立的 delivery v1 应用流接入直连／中继，边界见[范围推送](scoped-delivery.md)。
+实现入口：[crates/protocol](../crates/protocol/README.md)。已实现消息模型、Protobuf 有界帧、确定性 CBOR、Hello 协商、签名中继路由、EOA 公开事件、服务密钥回执及文件清单／块校验；编码细节和参考向量以该库说明及 [Protobuf schema](../crates/protocol/proto/red_leaves.proto) 为首版原型约定。已有单元／内存报文交换测试；节点另通过独立的 delivery v2 应用流接入直连／中继，边界见[范围推送](scoped-delivery.md)。
 
 NAS 本地 HTTP 图文／视频发帖已实现链查询、应用密钥保管、内容加密及持久化待投递任务，见[发帖说明](posting.md)。运行时已接入 Relay v2、范围投递及公开通知补漏；DHT 自动发现、本文完整的同步游标、服务 grant 和撤销检查仍未接入。用户上下文的 grant 仅保留有界载荷，不把解码成功解释为已授权；本地保存对象不能直接当成已认证的 P2P 报文。
 
@@ -24,7 +24,7 @@ NAS 本地 HTTP 图文／视频发帖已实现链查询、应用密钥保管、�
 - 首期由发送方保存待投递任务，中继不提供离线信箱；双方从未同时在线时不保证送达。
 - 黑名单及接收规则在获取正文前检查；全网可见不等于向所有节点广播。
 
-本版不设计真实支付结算、群聊、直播、链共识或链节点网络复用，也不修改现有智能合约。Web SIWE 登录和 Bearer API 是独立的客户端认证协议，不能直接当成 P2P 会话或设备授权。
+本版不设计真实支付结算、群聊、直播、链共识或链节点网络复用，也不修改现有智能合约。SIWE 登录及 Cookie／Bearer API 是独立的客户端认证协议，不能直接当成 P2P 会话或设备授权。
 
 ## 2. 角色、拓扑与权限
 
@@ -254,7 +254,7 @@ Frame {
 
 - `request_id` 关联一次请求／响应，不是业务事件 ID。超时重试可换请求 ID，业务 ID 必须保持不变。
 - Hello 帧尚无 `session_id`／`context_id`；打开用户上下文时携带已协商的会话 ID，上下文接受后才可在业务帧中使用其 context_id。会话建立前只接受 Hello／版本协商；未打开用户上下文时不接受私密读取和用户事件交换。
-- 依赖安全流的有序与完整性，不另造传输加密或凭证。不向其他 NAS、中继或发现网络发送本地 Web Bearer 令牌。
+- 依赖安全流的有序与完整性，不另造传输加密或凭证。不向其他 NAS、中继或发现网络发送本地客户端会话令牌。
 - 短控制响应与大文件分流，单用户大下载不得饿死保活、确认及其他用户的请求。
 
 ### 7.2 不可变签名事件

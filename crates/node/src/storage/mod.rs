@@ -36,32 +36,22 @@ pub async fn open(url: &str) -> Result<SqlitePool, Box<dyn std::error::Error + S
             }
         }
     }
-    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
-        .fetch_one(&pool)
-        .await?;
-    if version > 4 {
-        return Err("Unsupported database schema version".into());
-    }
     let mut tx = pool.begin().await?;
-    sqlx::raw_sql(include_str!("../../migrations/0001_auth.sql"))
-        .execute(&mut *tx)
+    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&mut *tx)
         .await?;
-    sqlx::raw_sql(include_str!("../../migrations/0002_posts.sql"))
-        .execute(&mut *tx)
-        .await?;
-    if version < 3 {
-        sqlx::raw_sql(include_str!("../../migrations/0003_media.sql"))
-            .execute(&mut *tx)
-            .await?;
+    match version {
+        0 => {
+            sqlx::raw_sql(include_str!("schema.sql"))
+                .execute(&mut *tx)
+                .await?;
+        }
+        6 => {}
+        _ => return Err("Unsupported database schema version. Use an empty database or a matching node version.".into()),
     }
-    if version < 4 {
-        sqlx::raw_sql(include_str!("../../migrations/0004_delivery.sql"))
-            .execute(&mut *tx)
-            .await?;
-    }
-    sqlx::query("PRAGMA user_version=4")
-        .execute(&mut *tx)
-        .await?;
     tx.commit().await?;
     Ok(pool)
 }
+
+#[cfg(all(test, feature = "nas"))]
+mod tests;

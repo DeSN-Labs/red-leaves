@@ -115,6 +115,11 @@ fn valid_secret(value: &str) -> bool {
 }
 
 pub fn router(pool: SqlitePool, config: Config) -> Router {
+    let origin: axum::http::HeaderValue = config
+        .uri
+        .trim_end_matches('/')
+        .parse()
+        .expect("Authentication URI must be a valid header value");
     let state = app_state(pool, config);
     Router::new()
         .route("/api/auth/challenge", post(challenge))
@@ -127,9 +132,14 @@ pub fn router(pool: SqlitePool, config: Config) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .layer(
             tower_http::cors::CorsLayer::new()
-                .allow_origin(tower_http::cors::Any)
+                .allow_origin(origin)
+                .allow_credentials(true)
                 .allow_methods([Method::GET, Method::POST])
-                .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]),
+                .allow_headers([
+                    header::CONTENT_TYPE,
+                    header::AUTHORIZATION,
+                    axum::http::HeaderName::from_static("x-red-leaves-client"),
+                ]),
         )
         .with_state(state)
 }
@@ -165,7 +175,15 @@ async fn guard(State(state): State<AppState>, request: Request, next: Next) -> R
     async move {
         let start = Instant::now();
         tracing::debug!("HTTP request received");
-        let response = guard_response(state, request, next).await;
+        let mut response = guard_response(state, request, next).await;
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+        response.headers_mut().insert(
+            header::PRAGMA,
+            axum::http::HeaderValue::from_static("no-cache"),
+        );
         let status = response.status().as_u16();
         let headers_ms = start.elapsed().as_millis() as u64;
         if response.status().is_server_error() {
@@ -179,6 +197,18 @@ async fn guard(State(state): State<AppState>, request: Request, next: Next) -> R
     .await
 }
 async fn guard_response(state: AppState, request: Request, next: Next) -> Response {
+    let headers = request.headers();
+    // A custom header forces cross-origin preflight. Same-origin GET requests may omit Origin.
+    let cookie_request = web_client(headers)
+        || (!headers.contains_key(header::AUTHORIZATION) && headers.contains_key(header::COOKIE));
+    if cookie_request
+        && (!web_client(headers)
+            || headers.get(header::ORIGIN).is_some_and(|origin| {
+                origin.to_str().ok() != Some(state.config.uri.trim_end_matches('/'))
+            }))
+    {
+        return ApiError(StatusCode::FORBIDDEN, "Untrusted browser request").into_response();
+    }
     let content_request = ["/api/posts", "/api/social/", "/api/content/", "/api/media"]
         .iter()
         .any(|prefix| request.uri().path().starts_with(prefix));
@@ -200,7 +230,7 @@ async fn guard_response(state: AppState, request: Request, next: Next) -> Respon
         false
     };
     let permit = state.permits.try_acquire();
-    let mut response = if !allowed || permit.is_err() {
+    if !allowed || permit.is_err() {
         ApiError(
             StatusCode::TOO_MANY_REQUESTS,
             "Authentication rate limit exceeded",
@@ -220,16 +250,7 @@ async fn guard_response(state: AppState, request: Request, next: Next) -> Respon
             )
             .into_response(),
         }
-    };
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        axum::http::HeaderValue::from_static("no-store"),
-    );
-    response.headers_mut().insert(
-        header::PRAGMA,
-        axum::http::HeaderValue::from_static("no-cache"),
-    );
-    response
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -286,15 +307,17 @@ struct VerifyRequest {
 }
 #[derive(Serialize)]
 struct SessionResponse {
-    token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
     address: String,
     chain_id: u64,
     expires_at: i64,
 }
 async fn verify(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(input): Json<VerifyRequest>,
-) -> Result<Json<SessionResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     if !valid_secret(&input.challenge_id) || !valid_secret(&input.verifier) {
         return Err(invalid());
     }
@@ -338,19 +361,60 @@ async fn verify(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(Json(SessionResponse {
-        token,
+    let browser = web_client(&headers);
+    let cookie = browser.then(|| session_cookie(&state.config, &token, SESSION_SECONDS));
+    let mut response = Json(SessionResponse {
+        token: if browser { None } else { Some(token) },
         address,
         chain_id: CHAIN_ID,
         expires_at,
-    }))
+    })
+    .into_response();
+    if let Some(cookie) = cookie {
+        response.headers_mut().insert(header::SET_COOKIE, cookie);
+    }
+    Ok(response)
 }
-fn bearer(headers: &HeaderMap) -> Result<&str, ApiError> {
-    let token = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .ok_or_else(invalid)?;
+fn web_client(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-red-leaves-client")
+        .is_some_and(|value| value == "web")
+}
+fn session_cookie(config: &Config, token: &str, max_age: i64) -> axum::http::HeaderValue {
+    let secure = if config.uri.starts_with("https://") {
+        "; Secure"
+    } else {
+        ""
+    };
+    format!(
+        "red_leaves_session={token}; Path=/api; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}"
+    )
+    .parse()
+    .expect("Session cookie contains only validated values")
+}
+fn session_token(headers: &HeaderMap) -> Result<&str, ApiError> {
+    let token = if headers.contains_key(header::AUTHORIZATION) {
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| h.strip_prefix("Bearer "))
+            .ok_or_else(invalid)?
+    } else {
+        if !web_client(headers) {
+            return Err(invalid());
+        }
+        let mut cookies = headers
+            .get_all(header::COOKIE)
+            .iter()
+            .filter_map(|h| h.to_str().ok())
+            .flat_map(|h| h.split(';'))
+            .filter_map(|entry| entry.trim().strip_prefix("red_leaves_session="));
+        let token = cookies.next().ok_or_else(invalid)?;
+        if cookies.next().is_some() {
+            return Err(invalid());
+        }
+        token
+    };
     if !valid_secret(token) {
         return Err(invalid());
     }
@@ -367,7 +431,7 @@ async fn me(
     headers: HeaderMap,
 ) -> Result<Json<UserResponse>, ApiError> {
     let row = sqlx::query("SELECT address,chain_id,expires_at FROM auth_sessions WHERE token_hash=? AND expires_at > ?")
-        .bind(identity::hash(bearer(&headers)?)).bind(now()).fetch_optional(&state.pool).await?.ok_or_else(invalid)?;
+        .bind(identity::hash(session_token(&headers)?)).bind(now()).fetch_optional(&state.pool).await?.ok_or_else(invalid)?;
     Ok(Json(UserResponse {
         address: row.try_get("address")?,
         chain_id: row.try_get("chain_id")?,
@@ -412,12 +476,24 @@ async fn nas_info(
             .is_some_and(|h| h.status.running.load(std::sync::atomic::Ordering::Relaxed)),
     }))
 }
-async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
-    sqlx::query("DELETE FROM auth_sessions WHERE token_hash=?")
-        .bind(identity::hash(bearer(&headers)?))
-        .execute(&state.pool)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
+async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
+    match session_token(&headers) {
+        Ok(token) => {
+            sqlx::query("DELETE FROM auth_sessions WHERE token_hash=?")
+                .bind(identity::hash(token))
+                .execute(&state.pool)
+                .await?;
+        }
+        Err(_) if web_client(&headers) => {}
+        Err(error) => return Err(error),
+    }
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    if web_client(&headers) {
+        response
+            .headers_mut()
+            .insert(header::SET_COOKIE, session_cookie(&state.config, "", 0));
+    }
+    Ok(response)
 }
 pub async fn cleanup(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;

@@ -54,9 +54,9 @@ A decentralized social network built around wallet-based identities, user-contro
 
    Users can tip creators when reading their content.
 
-8. **Paid content**
+8. **Posts and storefronts**
 
-   Creators can require users to pay before accessing specific content.
+   Posts have no prices or paid unlocking. Paid digital assets and other trading content belong in user storefronts, which remain a future feature.
 
 9. **Decentralized live streaming**
 
@@ -201,7 +201,7 @@ cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-The default NAS node runs an EOA wallet authentication API backed by SQLite; NAS PeerId persistence and explicit Web registration are implemented; text, photo and video publication, recipient encryption, reception preferences and testnet paid unlocking are implemented locally; scoped NAS-to-NAS delivery, Relay v2 transport, retries, live inbox updates and on-demand remote media are implemented; configure peer/relay addresses using the [delivery guide](docs/scoped-delivery.md). See [posting](docs/posting.md), [NAS registration](docs/nas-registration.md) and [wallet login](docs/wallet-login.md) for configuration and API details.
+The default NAS node runs an EOA wallet authentication API backed by SQLite; NAS PeerId persistence and explicit Web registration are implemented; text, photo and video publication, recipient encryption and reception preferences are implemented locally; posts have no pricing or paid unlocking; scoped NAS-to-NAS delivery, Relay v2 transport, retries, live inbox updates and on-demand remote media are implemented; configure peer/relay addresses using the [delivery guide](docs/scoped-delivery.md). See [posting](docs/posting.md), [NAS registration](docs/nas-registration.md) and [wallet login](docs/wallet-login.md) for configuration and API details.
 For the React + TypeScript + Vite Web prototype, use Node.js 22.12+, run `npm ci` and `npm run dev` in `web/`;
 `npm run build` produces static files. Run `forge build` and `forge test` in
 `contracts/` with Foundry installed. The user registry contract and tests are implemented; the [deployment record](contracts/deployments/base-sepolia.json) states the local receipt evidence and RPC verification limit; configure `contracts/.env.profile` using `.env.example` before running the [deployment script](contracts/README.md).
@@ -216,4 +216,4 @@ Cargo features are additive: enabling both includes both drivers. The NAS featur
 
 The identity registry design stores only the wallet address, associated NAS PeerId, content encryption public key, and nickname on-chain. Avatars (including their references and hashes), gender, and other profile information are fetched off-chain; private keys stay off-chain. Relay discovery and service authorization now require an off-chain design; replay protection, key rotation, and recovery remain pending. The contract and first-registration UI are implemented; see the [contract guide](contracts/README.md). See the [data exchange protocol](docs/data-exchange-protocol.md).
 
-The [node communication protocol v0.1 draft](docs/node-communication-protocol-v0.1.md) describes NAS and relay communication. The [shared protocol crate](crates/protocol/README.md) implements bounded Protobuf framing, deterministic CBOR, handshake negotiation, signed relay routes, EOA public-event verification, signed storage claims, and file manifest/chunk integrity checks, with reference vectors and in-memory exchange tests. Local NAS posting adds signed publication confirmation, encrypted key custody, recipient/paid encryption and a durable pending queue. Application delivery now dispatches this queue through direct or configured relay connections; automatic DHT discovery and grant/revocation enforcement remain unimplemented. See [scoped delivery](docs/scoped-delivery.md) and [posting and paid access](docs/posting.md).
+The [node communication protocol v0.1 draft](docs/node-communication-protocol-v0.1.md) describes NAS and relay communication. The [shared protocol crate](crates/protocol/README.md) implements bounded Protobuf framing, deterministic CBOR, handshake negotiation, signed relay routes, EOA public-event verification, signed storage claims, and file manifest/chunk integrity checks, with reference vectors and in-memory exchange tests. Local NAS posting adds signed publication confirmation, encrypted key custody, recipient encryption and a durable pending queue. Application delivery now dispatches this queue through direct or configured relay connections; automatic DHT discovery and grant/revocation enforcement remain unimplemented. See [scoped delivery](docs/scoped-delivery.md) and [posting and access control](docs/posting.md).

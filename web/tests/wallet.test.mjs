@@ -1,9 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { getNasInfo, checkNasSession, connectWallet, logoutWallet, sessionExpiresAt, nasApi, nasBlob, nasUpload, watchNasChanges } from "../src/wallet.ts";
+import { apiBaseUrl, getNasInfo, checkNasSession, connectWallet, logoutWallet, sessionExpiresAt, nasApi, nasBlob, nasUpload, watchNasChanges } from "../src/wallet.ts";
 
 const address = `0x${"12".repeat(20)}`;
 const challenge = { challenge_id: "id", verifier: "secret", message: "Sign in to Red Leaves" };
+const expires = Math.floor(Date.now() / 1000) + 3600;
+const authSession = () => ({ address, chain_id: 84532, expires_at: expires });
 function provider(overrides = {}) {
   globalThis.window = { ethereum: { async request({ method, params }) {
     if (method in overrides) return overrides[method](params);
@@ -19,25 +21,25 @@ function provider(overrides = {}) {
 }
 function response(body, status = 200) { return new Response(status === 204 ? null : JSON.stringify(body), { status }); }
 
-test("Web signs a challenge and revokes the Bearer session without cookies", async () => {
+test("Web signs a challenge and uses credentials without exposing a token", async () => {
   provider(); const calls = [];
   globalThis.fetch = async (url, options) => {
-    calls.push([url, options]); assert.equal(options.credentials, "omit");
+    calls.push([url, options]); assert.equal(options.credentials, "include");
     assert.equal(new URL(url).origin, "http://127.0.0.1:3000");
     if (url.endsWith("challenge")) return response(challenge);
     if (url.endsWith("verify")) {
       assert.deepEqual(JSON.parse(options.body), { challenge_id: "id", verifier: "secret", signature: "0xsignature" });
-      return response({ token: "token", address, expires_at: 100 });
+      return response(authSession("token"));
     }
-    assert.equal(options.headers.Authorization, "Bearer token");
+    assert.equal(options.headers.Authorization, undefined);
     if (url.endsWith("info")) return response({ node_type: "nas", peer_id: "12D3KooWTestPeerId", p2p_running: false });
     if (url.endsWith("me")) {
       assert.equal(options.method, "GET");
-      return response({ address, chain_id: 84532, expires_at: 100 });
+      return response({ address, chain_id: 84532, expires_at: expires });
     }
     return response(null, 204);
   };
-  assert.equal(await connectWallet(), address); assert.equal(sessionExpiresAt(), 100);
+  assert.equal(await connectWallet(), address); assert.equal(sessionExpiresAt(), expires);
   assert.equal((await checkNasSession()).address, address);
   assert.deepEqual(await getNasInfo(), { node_type: "nas", peer_id: "12D3KooWTestPeerId", p2p_running: false });
   await logoutWallet(); assert.equal(sessionExpiresAt(), 0); assert.equal(calls.length, 5);
@@ -66,12 +68,12 @@ test("logout racing verification revokes the newly issued session", async () => 
   globalThis.fetch = async (url, options) => {
     if (url.endsWith("challenge")) return response(challenge);
     if (url.endsWith("verify")) { started(); return issued; }
-    assert.equal(options.headers.Authorization, "Bearer late-token"); revoked = true;
+    assert.equal(options.headers.Authorization, undefined); revoked = true;
     return response(null, 204);
   };
   const login = connectWallet();
   await pending; await logoutWallet();
-  release(response({ token: "late-token", address, expires_at: 100 }));
+  release(response(authSession("late-token")));
   await assert.rejects(login, /Wallet state changed/); assert.ok(revoked); assert.equal(sessionExpiresAt(), 0);
 });
 
@@ -79,7 +81,7 @@ test("NAS checks reject unavailable or revoked server sessions", async () => {
   provider();
   globalThis.fetch = async url => {
     if (url.endsWith("challenge")) return response(challenge);
-    if (url.endsWith("verify")) return response({ token: "token", address, expires_at: 100 });
+    if (url.endsWith("verify")) return response(authSession("token"));
     if (url.endsWith("me")) return response({ error: "Invalid or expired authentication" }, 401);
     return response(null, 204);
   };
@@ -97,7 +99,7 @@ test("profile registration requires a NAS node and explains outdated server endp
   provider();
   globalThis.fetch=async url=>{
     if(url.endsWith("challenge"))return response(challenge);
-    if(url.endsWith("verify"))return response({token:"token",address,expires_at:100});
+    if(url.endsWith("verify"))return response(authSession("token"));
     return response(null,204);
   };
   await connectWallet();
@@ -111,15 +113,15 @@ test("profile registration requires a NAS node and explains outdated server endp
   await logoutWallet();
 });
 
-test("content requests use Bearer authentication and reject responses after logout", async () => {
+test("content requests use cookie authentication and reject responses after logout", async () => {
   provider(); let release, started;
   const pending = new Promise(resolve => { started = resolve; });
   const result = new Promise(resolve => { release = resolve; });
   globalThis.fetch = async (url, options) => {
     if (url.endsWith("challenge")) return response(challenge);
-    if (url.endsWith("verify")) return response({ token: "content-token", address, expires_at: 100 });
-    assert.equal(options.credentials, "omit");
-    assert.equal(options.headers.Authorization, "Bearer content-token");
+    if (url.endsWith("verify")) return response(authSession("content-token"));
+    assert.equal(options.credentials, "include");
+    assert.equal(options.headers.Authorization, undefined);
     if (url.endsWith("logout")) return response(null, 204);
     assert.ok(url.endsWith("/api/posts")); return { ok: true, async json() { started(); return result; } };
   };
@@ -135,9 +137,9 @@ test("media transfers use the session and discard blob responses after logout", 
  const result = new Promise(resolve => { release = resolve; });
  globalThis.fetch = async (url, options) => {
    if (url.endsWith("challenge")) return response(challenge);
-   if (url.endsWith("verify")) return response({ token: "media-token", address, expires_at: 100 });
-   assert.equal(options.headers.Authorization, "Bearer media-token");
-   assert.equal(options.credentials, "omit");
+   if (url.endsWith("verify")) return response(authSession("media-token"));
+   assert.equal(options.headers.Authorization, undefined);
+   assert.equal(options.credentials, "include");
    if (url.endsWith("logout")) return response(null, 204);
    if (options.method === "POST") { assert.equal(options.headers["Content-Type"], "image/png"); assert(options.body instanceof File); return response({id:"upload"}); }
    return { ok: true, async blob() { started(); return result; } };
@@ -154,7 +156,7 @@ test("media downloads stay within two concurrent transfers", async () => {
   const releases = [];
   globalThis.fetch = async url => {
     if (url.endsWith("challenge")) return response(challenge);
-    if (url.endsWith("verify")) return response({ token: "media-limit", address, expires_at: 100 });
+    if (url.endsWith("verify")) return response(authSession("media-limit"));
     if (url.endsWith("logout")) return response(null, 204);
     active++; entered++; maximum = Math.max(maximum, active);
     return { ok: true, async blob() { await new Promise(resolve => releases.push(resolve)); active--; return new Blob(["image"]); } };
@@ -172,14 +174,14 @@ test("media downloads stay within two concurrent transfers", async () => {
   await logoutWallet();
 });
 
-test("live updates use Bearer SSE, decode fragmented frames and stop on cancellation", async () => {
+test("live updates use cookie SSE, decode fragmented frames and stop on cancellation", async () => {
  provider(); const controller=new AbortController();let updates=0;
  globalThis.fetch=async(url,options)=>{
   if(url.endsWith("challenge"))return response(challenge);
-  if(url.endsWith("verify"))return response({token:"live",address,expires_at:100});
+  if(url.endsWith("verify"))return response(authSession("live"));
   if(url.endsWith("logout"))return response(null,204);
   assert(url.endsWith("/api/social/events"));assert(!url.includes("token="));
-  assert.equal(options.headers.Authorization,"Bearer live");assert.equal(options.credentials,"omit");
+  assert.equal(options.headers.Authorization, undefined);assert.equal(options.credentials,"include");
   const encoder=new TextEncoder();
   return new Response(new ReadableStream({start(stream){stream.enqueue(encoder.encode(": keepalive\n\nevent: sy"));stream.enqueue(encoder.encode("nc\ndata: {}\n\nevent: update\ndata: {}\n\n"));}}),{headers:{"Content-Type":"text/event-stream"}});
  };
@@ -191,7 +193,7 @@ test("live updates never invoke callbacks from a buffered stream after logout", 
  provider();const controller=new AbortController();let updates=0,logout;
  globalThis.fetch=async url=>{
   if(url.endsWith("challenge"))return response(challenge);
-  if(url.endsWith("verify"))return response({token:"live-race",address,expires_at:100});
+  if(url.endsWith("verify"))return response(authSession("live-race"));
   if(url.endsWith("logout"))return response(null,204);
   return new Response(new ReadableStream({start(stream){stream.enqueue(new TextEncoder().encode("event: update\ndata: {}\n\nevent: update\ndata: {}\n\n"));}}));
  };

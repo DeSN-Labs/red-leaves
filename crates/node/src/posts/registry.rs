@@ -6,21 +6,18 @@ use serde_json::{Value, json};
 sol! {
     struct RegistryUser { string nasPeerId; bytes encryptionPublicKey; string nickname; }
     function getUser(address owner) external view returns (RegistryUser);
-    function getPost(address owner, bytes32 postId) external view returns (address author, uint128 price, bytes encryptedKey);
-    function purchased(address owner, bytes32 postId, address buyer) external view returns (bool);
 }
 pub struct Chain {
     client: reqwest::Client,
     rpc: String,
     pub registry: Address,
-    pub market: Option<Address>,
 }
 pub struct Profile {
     pub peer: String,
     pub public_key: Vec<u8>,
 }
 impl Chain {
-    pub fn new(rpc: String, registry: Address, market: Option<Address>) -> Result<Self, Error> {
+    pub fn new(rpc: String, registry: Address) -> Result<Self, Error> {
         let url = reqwest::Url::parse(&rpc)?;
         if url.scheme() != "https"
             && !(url.scheme() == "http"
@@ -35,7 +32,6 @@ impl Chain {
                 .build()?,
             rpc,
             registry,
-            market,
         })
     }
     async fn rpc(&self, method: &str, params: Value) -> Result<Value, Error> {
@@ -132,50 +128,5 @@ impl Chain {
             peer: profile.nasPeerId,
             public_key: profile.encryptionPublicKey.to_vec(),
         })
-    }
-    pub async fn listing(
-        &self,
-        owner: Address,
-        id: [u8; 32],
-    ) -> Result<(Address, u128, Vec<u8>), Error> {
-        let block = self.block(2).await?;
-        let bytes = self
-            .call(
-                self.market
-                    .ok_or("Post access contract is not configured")?,
-                getPostCall {
-                    owner: owner.0.into(),
-                    postId: id.into(),
-                },
-                &block,
-            )
-            .await?;
-        let value = getPostCall::abi_decode_returns(&bytes)?;
-        Ok((
-            Address(value.author.into_array()),
-            value.price,
-            value.encryptedKey.to_vec(),
-        ))
-    }
-    pub async fn has_paid(
-        &self,
-        owner: Address,
-        id: [u8; 32],
-        buyer: Address,
-    ) -> Result<bool, Error> {
-        let block = self.block(2).await?;
-        let bytes = self
-            .call(
-                self.market
-                    .ok_or("Post access contract is not configured")?,
-                purchasedCall {
-                    owner: owner.0.into(),
-                    postId: id.into(),
-                    buyer: buyer.0.into(),
-                },
-                &block,
-            )
-            .await?;
-        Ok(purchasedCall::abi_decode_returns(&bytes)?)
     }
 }

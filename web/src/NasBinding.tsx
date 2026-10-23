@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import type { Hex } from "viem";
 import { createRegistry, registryAddress, type Registration } from "./registry";
-import { getNasInfo, nasApi, type Provider } from "./wallet";
+import { getNasInfo, nasApi, getWalletProvider } from "./wallet";
 
 export function NasBinding({ owner }: { owner: string }) {
   const [peerId, setPeerId] = useState("");
@@ -18,8 +18,7 @@ export function NasBinding({ owner }: { owner: string }) {
   const [hash, setHash] = useState<Hex | null>(null);
   const generation = useRef(0);
   const gateway = () => {
-    if (!window.ethereum) throw new Error("No wallet provider is available.");
-    return createRegistry(window.ethereum as Provider, registryAddress, owner, localStorage);
+    return createRegistry(getWalletProvider(), registryAddress, owner, localStorage);
   };
   const explain = (cause: unknown) => {
     const code = (cause as { code?: number; cause?: { code?: number } })?.code

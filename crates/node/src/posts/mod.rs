@@ -28,7 +28,6 @@ impl Service {
             ),
         );
         let address = std::env::var("RED_LEAVES_USER_REGISTRY_ADDRESS").unwrap_or_default();
-        let market = std::env::var("RED_LEAVES_POST_ACCESS_ADDRESS").unwrap_or_default();
         let chain = if address.is_empty() {
             None
         } else {
@@ -36,11 +35,6 @@ impl Service {
                 std::env::var("RED_LEAVES_RPC_URL")
                     .unwrap_or_else(|_| "https://sepolia.base.org".into()),
                 Address(crate::identity::address(&address)?),
-                if market.is_empty() {
-                    None
-                } else {
-                    Some(Address(crate::identity::address(&market)?))
-                },
             )?)
         };
         Ok(Arc::new(Self {
