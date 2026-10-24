@@ -110,6 +110,7 @@ impl PostDraft {
 pub enum Action {
     Publish { post: PostDraft },
     Follow { target: Address, enabled: bool },
+    Like { post_id: ContentId, enabled: bool },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -136,6 +137,9 @@ impl Intent {
         }
         match &self.action {
             Action::Publish { post } => post.validate(self.actor)?,
+            Action::Like { post_id, .. } => {
+                ContentId::from_slice(post_id.as_bytes())?;
+            }
             Action::Follow { target, .. } if target.0 == [0; 20] || *target == self.actor => {
                 return Err(Error::InvalidMessage);
             }

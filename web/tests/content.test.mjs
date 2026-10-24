@@ -36,3 +36,13 @@ test("reviewed publications cannot gain pricing fields", () => {
  const action = { action: "publish", post: { title: "Post", body: "Text", distribution: "broadcast", recipients: [] } };
  assert(!actionsMatch({ ...action, post: { ...action.post, price_wei: "0" } }, action));
 });
+
+test("like review binds the complete post multihash and the enabled flag", () => {
+  const post_id = [0x12,0x20,...Array(32).fill(7)];
+  const action = { action: "like", post_id, enabled: true };
+  assert(actionsMatch({ enabled: true, post_id: [...post_id], action: "like" }, action));
+  assert(!actionsMatch({ ...action, enabled: false }, action));
+  assert(!actionsMatch({ ...action, post_id: [...post_id.slice(0,-1),8] }, action));
+  const canonical = encodeCanonical({ ...action, post_id: new Uint8Array(post_id) });
+  assert(Buffer.from(canonical).includes(Buffer.from([0x58,0x22,0x12,0x20])));
+});

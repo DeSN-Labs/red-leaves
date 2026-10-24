@@ -32,7 +32,7 @@ RPC 必须属于 Base Sepolia（84532），外部地址使用 HTTPS；本地测�
 
 列表使用封面卡片，点击打开图片轮播／视频与文字的详情；后端按保存时间和 ID 倒序分页返回，每页最多 50 条，前端保持顺序。媒体进入可见区域后才请求，视频首版完整下载到有界 Blob 后播放，不支持分段流播、服务端缩略图或断点续传。
 
-传播范围为 `broadcast`（全网广播）、`following`（我关注的人）、`followers`（关注我的人）、`friends`（互相关注）、`directed`（指定的人）。指定人可勾选好友／关注列表并补充钱包地址，合并去重后签名。关系范围由当前 NAS 保存及同步的真实关注关系解析，服务端准备签名时核对精确名单；名单不符返回 409，须刷新后重新确认。签名后名单固定，后续关系变化不会扩大旧帖授权。除 broadcast 外全部加密定向存储与投递，接收偏好不会扩大访问权限；黑名单用户的内容不得被动投递。
+传播范围为 `broadcast`（全网广播）、`following`（我关注的人）、`followers`（关注我的人）、`friends`（互相关注）、`directed`（指定的人）。指定人可勾选好友／关注列表并补充钱包地址，合并去重后签名。关系范围由当前 NAS 保存及同步的真实关注关系解析，服务端准备签名时核对精确名单；名单不符返回 409，须刷新后重新确认。签名后初始投递名单固定；访问权限可在发布后另行调整，following／followers 使用当前关系，见[作品访问权限](post-access.md)。除 broadcast 外全部加密定向存储与投递，接收偏好不会扩大访问权限；黑名单用户的内容不得被动投递。
 
 上传采用 `POST /api/media`，Body 是原始文件，Content-Type 必须是允许的 MIME，使用 SIWE 会话认证（Web Cookie／原生 Bearer）。上传仅产生私有草稿，不建立投递任务。`GET /api/media` 可恢复未引用上传；`POST /api/media/{id}/discard` 仅删除自己的未引用文件，已被帖子引用的文件不能删除。发布的 `media` 包含上传 ID、MIME、原始字节大小与 SHA-256 multihash 摘要，均纳入规范 CBOR 和签名；准备及提交检查文件归属和元数据。
 
@@ -42,7 +42,7 @@ RPC 必须属于 Base Sepolia（84532），外部地址使用 HTTPS；本地测�
 
 ## 签名、加密与持久化
 
-`social::Intent` 包含 scope、actor、NAS PeerId、nonce、签发／过期时间及 `Publish`／`Follow` 动作，使用严格确定性 CBOR。新 `Publish.post` 只包含 `title`、`body`、`distribution`、`recipients` 及可选 `media`，不含价格字段；旧请求即使携带 `price_wei: "0"` 也会被拒绝。空 `media` 字段省略。
+`social::Intent` 包含 scope、actor、NAS PeerId、nonce、签发／过期时间及 `Publish`／`Follow`／`Like` 动作，使用严格确定性 CBOR。新 `Publish.post` 只包含 `title`、`body`、`distribution`、`recipients` 及可选 `media`，不含价格字段；旧请求即使携带 `price_wei: "0"` 也会被拒绝。空 `media` 字段省略。
 
 EIP-712 域沿用 `RedLeaves`／`1`、链 ID、UserRegistry 地址，主类型为 `SocialAction(bytes32 payloadHash)`，内容 ID 域仍为 `red-leaves/social/1\0`。完整载荷参与哈希，移除字段后的新帖子具有不同的签名与 ID；不复用 SIWE 或旧 `PublicEvent` 签名。准备挑战有效期 15 分钟，每用户最多 16 个待签名动作。
 
@@ -58,7 +58,7 @@ Web 在签名前独立重建 CBOR，核对显示内容、附件、受众、钱�
 
 ## 存储初始化与版本
 
-SQLite 使用一份完整的 [schema.sql](../crates/node/src/storage/schema.sql) 初始化当前 version 6 数据库，不保留历史迁移、归档表或旧数据读取分支。空库首次启动自动建表，当前版本正常重开；其他版本拒绝启动，不将旧表当作新格式使用。
+SQLite 使用 [schema.sql](../crates/node/src/storage/schema.sql) 、[likes.sql](../crates/node/src/storage/likes.sql) 与 [access.sql](../crates/node/src/storage/access.sql) 初始化 version 8 数据库；version 6／7 增量增加互动及访问权限表并保留原有数据，当前版本正常重开；更早或未知版本拒绝启动，不将旧付费帖表当作新格式使用。
 
 旧开发数据可直接删除，无需迁移或导入。先停止使用该数据库的 NAS，再删除 `RED_LEAVES_DATABASE_URL` 指定的 SQLite 文件及对应的 `-wal`、`-shm` 文件，同时清理 `RED_LEAVES_CONTENT_PATH` 内容目录；下一次启动创建新库。默认对应工作目录下的 `red-leaves.sqlite` 和 `runtime/nas/content`。删除数据库后需重新登录，原帖子、关注、偏好和投递状态不恢复。节点身份、主密钥和用户密钥不在内容目录中，不属于此次数据重建范围。
 
@@ -84,6 +84,8 @@ SQLite 使用一份完整的 [schema.sql](../crates/node/src/storage/schema.sql)
 | `GET /api/posts?mine=true&offset=0` | 我的帖子及投递进度；省略 mine 则按接收偏好筛选 |
 | `GET /api/posts/{id}` | 验证受众，返回 `id`、`intent` 及 `signature` |
 | `GET /api/posts/{id}/delivery` | 作者查询逐目标投递状态 |
+
+点赞提交与按需拉取、作者当前权限控制见[点赞同步](likes.md)。
 
 发布提交返回 `id`、`author` 和 `status: "saved_pending_network"`；关注提交返回 `status: "saved"`。帖子列表及详情不返回价格、市场合约、`locked` 或付费密钥。旧 `/listing`、`/activate`、`/purchase-info`、`/unlock` 路由已删除，返回 404。
 

@@ -74,6 +74,10 @@ async function api<T>(path: string, body?: unknown): Promise<T> {
   return response.status === 204 ? undefined as T : response.json();
 }
 export const sessionExpiresAt = () => expiresAt;
+export class NasRequestError extends Error {
+  readonly status: number;
+  constructor(message: string, status: number) { super(message); this.status = status; }
+}
 export async function nasApi<T>(path: string, body?: unknown): Promise<T> {
   const wasAuthenticated = authenticated, currentRevision = revision;
   if (!wasAuthenticated) throw new Error("Sign in with your wallet to use your NAS.");
@@ -85,7 +89,7 @@ export async function nasApi<T>(path: string, body?: unknown): Promise<T> {
   if (wasAuthenticated !== authenticated || currentRevision !== revision) throw new Error("Wallet state changed. Please sign in again.");
   if (!response.ok) {
     const value = await response.json().catch(() => null) as { error?: string } | null;
-    throw new Error(value?.error ?? `NAS request failed (${response.status}).`);
+    throw new NasRequestError(value?.error ?? `NAS request failed (${response.status}).`, response.status);
   }
   const result = await response.json() as T;
   if (wasAuthenticated !== authenticated || currentRevision !== revision) throw new Error("Wallet state changed. Please sign in again.");

@@ -201,3 +201,19 @@ test("live updates never invoke callbacks from a buffered stream after logout", 
  await assert.rejects(watchNasChanges(()=>{updates++;logout=logoutWallet();},controller.signal),/Wallet state changed/);
  await logout;assert.equal(updates,1);controller.abort();
 });
+
+test("NAS HTTP errors retain status so unavailable statistics are distinct from denied access", async () => {
+  provider();
+  globalThis.fetch = async url => {
+    if (url.endsWith("challenge")) return response(challenge);
+    if (url.endsWith("verify")) return response(authSession());
+    return response(null,204);
+  };
+  await connectWallet();
+  for (const status of [404,503]) {
+    globalThis.fetch = async () => response({ error: "Likes unavailable" },status);
+    await assert.rejects(nasApi("posts/id/likes"), cause => cause.status === status && cause.message === "Likes unavailable");
+  }
+  globalThis.fetch = async () => response(null,204);
+  await logoutWallet();
+});

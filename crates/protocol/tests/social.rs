@@ -182,3 +182,33 @@ fn delivery_notices_reject_private_titles_wrong_scope_and_unbounded_fields() {
     notice.created_at = 1200;
     assert!(notice.validate(&intent.scope, 1001).is_err());
 }
+
+#[test]
+fn like_signature_binds_post_and_enabled_state() {
+    let (mut intent, key) = action();
+    intent.action = Action::Like {
+        post_id: red_leaves_protocol::ContentId::of(b"post"),
+        enabled: true,
+    };
+    let signed = signature(&intent, &key);
+    assert!(
+        Intent::verify(
+            &intent.encode().unwrap(),
+            &signed,
+            &intent.scope,
+            &intent.nas_peer_id,
+            1001
+        )
+        .is_ok()
+    );
+    intent.action = Action::Like {
+        post_id: red_leaves_protocol::ContentId::of(b"post"),
+        enabled: false,
+    };
+    assert!(intent.verify_signature(&signed).is_err());
+    intent.action = Action::Like {
+        post_id: red_leaves_protocol::ContentId::of(b"another"),
+        enabled: true,
+    };
+    assert!(intent.verify_signature(&signed).is_err());
+}

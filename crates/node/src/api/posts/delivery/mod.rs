@@ -6,19 +6,19 @@ use red_leaves_protocol::delivery::{
     CHUNK, Notice, Request as NetRequest, Response as NetResponse,
 };
 
-fn network(state: &AppState) -> Result<Handle, ApiError> {
+pub(super) fn network(state: &AppState) -> Result<Handle, ApiError> {
     service(state)?.runtime.network().ok_or_else(unavailable)
 }
-fn cid(id: &str) -> Result<ContentId, ApiError> {
+pub(super) fn cid(id: &str) -> Result<ContentId, ApiError> {
     ContentId::from_slice(&bytes(id)?).map_err(|_| bad())
 }
-fn peer(value: &str) -> Result<PeerId, ApiError> {
+pub(super) fn peer(value: &str) -> Result<PeerId, ApiError> {
     value.parse().map_err(|_| bad())
 }
 fn aad(id: &str, viewer: &str) -> String {
     format!("red-leaves/delivery/2/{id}/{viewer}")
 }
-async fn profile(
+pub(super) async fn profile(
     state: &AppState,
     owner: &str,
 ) -> Result<crate::posts::registry::Profile, ApiError> {
@@ -92,9 +92,28 @@ async fn notice(state: &AppState, id: &str) -> Result<Notice, ApiError> {
         .fetch_optional(&state.pool)
         .await?
         .ok_or_else(forbidden)?;
-    let distribution: Distribution =
-        serde_json::from_value(json!(row.get::<String, _>("audience_scope")))
-            .map_err(|_| unavailable())?;
+    let level: String = sqlx::query_scalar("SELECT level FROM social_post_access WHERE post_id=?")
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await?;
+    let distribution = match level.as_str() {
+        "public" => Distribution::Broadcast,
+        "following" => Distribution::Following,
+        "followers" => Distribution::Followers,
+        "directed" => Distribution::Directed,
+        _ => return Err(forbidden()),
+    };
+    let title = if distribution == Distribution::Broadcast {
+        let stored = load_object(&row)?;
+        let payload = decode_content(service(state)?, &row, id, &stored)?;
+        let intent: Intent = canonical::decode(&payload, 32 * 1024).map_err(|_| unavailable())?;
+        let Action::Publish { post } = intent.action else {
+            return Err(bad());
+        };
+        post.title
+    } else {
+        String::new()
+    };
     Ok(Notice {
         scope: service(state)?.scope().map_err(|_| unavailable())?,
         id: cid(id)?,
@@ -102,11 +121,7 @@ async fn notice(state: &AppState, id: &str) -> Result<Notice, ApiError> {
         source_peer: state.config.peer_id.clone(),
         distribution: distribution.clone(),
         created_at: row.get::<i64, _>("created_at") as u64,
-        title: if distribution == Distribution::Broadcast {
-            row.get("title")
-        } else {
-            String::new()
-        },
+        title,
     })
 }
 async fn check_notice(state: &AppState, source: PeerId, notice: &Notice) -> Result<(), ApiError> {
@@ -139,15 +154,11 @@ fn open_content(
         &notice.scope,
     )
     .map_err(|_| forbidden())?;
-    let Action::Publish { post } = &intent.action else {
+    if !matches!(intent.action, Action::Publish { .. }) {
         return Err(bad());
-    };
-    if intent.actor != notice.author
-        || intent.nas_peer_id != notice.source_peer
-        || post.distribution != notice.distribution
-        || (post.distribution != Distribution::Broadcast
-            && !post.recipients.contains(&address(viewer)?))
-    {
+    }
+    // The authenticated author granted this viewer access; publication audience is historical metadata.
+    if intent.actor != notice.author {
         return Err(forbidden());
     }
     Ok(intent)
@@ -195,7 +206,7 @@ async fn save_inbox(
             "Inbox quota reached",
         ));
     }
-    sqlx::query("INSERT INTO social_inbox(post_id,recipient,author,source_peer,notice,received_at,created_at,object_path) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(post_id,recipient) DO UPDATE SET object_path=COALESCE(excluded.object_path,social_inbox.object_path)")
+    sqlx::query("INSERT INTO social_inbox(post_id,recipient,author,source_peer,notice,received_at,created_at,object_path) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(post_id,recipient) DO UPDATE SET object_path=COALESCE(excluded.object_path,social_inbox.object_path),notice=excluded.notice,source_peer=excluded.source_peer")
         .bind(hex::encode(notice.id.as_bytes())).bind(viewer).bind(wallet(notice.author)).bind(&notice.source_peer).bind(serde_json::to_string(notice).map_err(|_|bad())?).bind(now()).bind(notice.created_at as i64).bind(object).execute(&state.pool).await?;
     service(state)?.runtime.changed(viewer);
     Ok(())
@@ -238,6 +249,7 @@ async fn receive(
             .fetch_optional(&state.pool)
             .await?;
     if let Some(row) = previous {
+        save_inbox(state, viewer, notice, None).await?;
         return Ok(NetResponse::Saved {
             body: row.get::<Option<String>, _>("object_path").is_some(),
         });
@@ -282,7 +294,7 @@ pub(super) async fn remote_row(
 fn row_notice(row: &sqlx::sqlite::SqliteRow) -> Result<Notice, ApiError> {
     serde_json::from_str(&row.get::<String, _>("notice")).map_err(|_| unavailable())
 }
-fn cached_content(
+pub(super) fn cached_content(
     state: &AppState,
     viewer: &str,
     row: &sqlx::sqlite::SqliteRow,
@@ -299,6 +311,76 @@ fn cached_content(
     let intent = open_content(state, viewer, &row_notice(row)?, &response)?;
     Ok((intent, response))
 }
+pub(super) fn response_error(response: &NetResponse) -> Result<(), ApiError> {
+    match response {
+        NetResponse::Error { code } if code == "403" || code == "404" => Err(forbidden()),
+        NetResponse::Error { .. } => Err(unavailable()),
+        _ => Ok(()),
+    }
+}
+async fn authorize_read(
+    state: &AppState,
+    id: &str,
+    viewer: &str,
+    author: &str,
+) -> Result<PeerId, ApiError> {
+    let source = peer(&profile(state, author).await?.peer)?;
+    let response = network(state)?
+        .request(
+            source,
+            NetRequest::Access {
+                id: cid(id)?,
+                viewer: address(viewer)?,
+            },
+        )
+        .await
+        .map_err(|_| unavailable())?;
+    response_error(&response)?;
+    if !matches!(response, NetResponse::Access { .. }) {
+        return Err(unavailable());
+    }
+    Ok(source)
+}
+pub(super) async fn open_shared(
+    state: &AppState,
+    id: &str,
+    viewer: &str,
+    author: &str,
+) -> Result<Json<Value>, ApiError> {
+    let target = profile(state, author).await?;
+    if target.peer == state.config.peer_id {
+        return Err(forbidden());
+    }
+    let source = peer(&target.peer)?;
+    let response = network(state)?
+        .request(
+            source,
+            NetRequest::Fetch {
+                id: cid(id)?,
+                viewer: address(viewer)?,
+            },
+        )
+        .await
+        .map_err(|_| unavailable())?;
+    response_error(&response)?;
+    let notice = Notice {
+        scope: service(state)?.scope().map_err(|_| unavailable())?,
+        id: cid(id)?,
+        author: address(author)?,
+        source_peer: target.peer,
+        distribution: Distribution::Directed,
+        created_at: now() as u64,
+        title: String::new(),
+    };
+    let intent = open_content(state, viewer, &notice, &response)?;
+    let notice = Notice {
+        created_at: intent.issued_at,
+        ..notice
+    };
+    let path = write_object(service(state)?, id, &response).map_err(|_| unavailable())?;
+    save_inbox(state, viewer, &notice, Some(path)).await?;
+    remote_read(state, id, viewer).await
+}
 pub(super) async fn remote_read(
     state: &AppState,
     id: &str,
@@ -306,12 +388,14 @@ pub(super) async fn remote_read(
 ) -> Result<Json<Value>, ApiError> {
     let row = remote_row(state, id, viewer).await?.ok_or_else(forbidden)?;
     let notice = row_notice(&row)?;
+    // Already delivered copies remain readable independently of later author policy changes.
     let (intent, response) = if row.get::<Option<String>, _>("object_path").is_some() {
         cached_content(state, viewer, &row)?
     } else {
+        let source = authorize_read(state, id, viewer, &wallet(notice.author)).await?;
         let response = network(state)?
             .request(
-                peer(&notice.source_peer)?,
+                source,
                 NetRequest::Fetch {
                     id: notice.id,
                     viewer: address(viewer)?,
@@ -319,6 +403,7 @@ pub(super) async fn remote_read(
             )
             .await
             .map_err(|_| unavailable())?;
+        response_error(&response)?;
         let intent = open_content(state, viewer, &notice, &response)?;
         let path = write_object(service(state)?, id, &response).map_err(|_| unavailable())?;
         save_inbox(state, viewer, &notice, Some(path)).await?;
@@ -347,7 +432,7 @@ pub(super) async fn remote_media(
         .iter()
         .find(|file| file.id == media_id)
         .ok_or_else(forbidden)?;
-    let source = peer(&intent.nas_peer_id)?;
+    let source = peer(&profile(state, &wallet(intent.actor)).await?.peer)?;
     let handle = network(state)?;
     let response = handle
         .request(
@@ -360,6 +445,7 @@ pub(super) async fn remote_media(
         )
         .await
         .map_err(|_| unavailable())?;
+    response_error(&response)?;
     let NetResponse::Media {
         token,
         envelope,
@@ -384,6 +470,7 @@ pub(super) async fn remote_media(
             )
             .await
             .map_err(|_| unavailable())?;
+        response_error(&response)?;
         let NetResponse::Chunk { bytes } = response else {
             return Err(unavailable());
         };
@@ -416,5 +503,5 @@ pub(super) async fn remote_media(
 
 mod server;
 mod worker;
-use server::Server;
+pub(super) use server::Server;
 pub(in crate::api) use worker::start;

@@ -13,6 +13,9 @@ use zeroize::Zeroizing;
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .merge(media::routes())
+        .route("/api/posts/{id}/access", get(access::get).post(access::set))
+        .route("/api/posts/{id}/likes", get(likes::read))
+        .route("/api/posts/{id}/likes/access", post(likes::access))
         .route("/api/content/key", get(public_key))
         .route("/api/social/prepare", post(prepare))
         .route("/api/social/commit", post(commit))
@@ -124,6 +127,21 @@ async fn prepare(
         media::validate_uploads(&state.pool, &owner, &post.media).await?;
     }
     let mut issued_at = now() as u64;
+    if let Action::Like { post_id, .. } = &input.action {
+        let id = hex::encode(post_id.as_bytes());
+        likes::held_author(&state, &id, &owner).await?;
+        let previous: Option<i64> = sqlx::query_scalar("SELECT MAX(issued_at) FROM (SELECT issued_at FROM social_like_sync WHERE post_id=? AND owner=? UNION ALL SELECT issued_at FROM social_likes WHERE post_id=? AND owner=?)")
+            .bind(&id).bind(&owner).bind(&id).bind(&owner).fetch_one(&state.pool).await?;
+        if let Some(previous) = previous {
+            issued_at = issued_at.max(previous as u64 + 1);
+        }
+        if issued_at > now() as u64 + 120 {
+            return Err(ApiError(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many like changes. Retry shortly.",
+            ));
+        }
+    }
     if let Action::Follow { target, .. } = &input.action {
         let previous: Option<i64> = sqlx::query_scalar(
             "SELECT issued_at FROM social_follow_versions WHERE owner=? AND target=?",
@@ -239,7 +257,7 @@ async fn commit(
     if exists != 1 {
         return Err(bad());
     }
-    if matches!(intent.action, Action::Follow { .. }) {
+    if matches!(intent.action, Action::Follow { .. } | Action::Like { .. }) {
         let registered = service
             .chain
             .as_ref()
@@ -250,10 +268,15 @@ async fn commit(
         if registered.peer != state.config.peer_id {
             return Err(ApiError(
                 StatusCode::CONFLICT,
-                "Follow changes require the NAS registered to this wallet",
+                "Social changes require the NAS registered to this wallet",
             ));
         }
     }
+    let like_author = if let Action::Like { post_id, .. } = &intent.action {
+        Some(likes::held_author(&state, &hex::encode(post_id.as_bytes()), &owner).await?)
+    } else {
+        None
+    };
     let mut post_record = None;
     if let Action::Publish { ref post } = intent.action {
         media::validate_uploads(&state.pool, &owner, &post.media).await?;
@@ -338,6 +361,31 @@ async fn commit(
         return Err(bad());
     }
     match &intent.action {
+        Action::Like { post_id, enabled } => {
+            let post_id = hex::encode(post_id.as_bytes());
+            let result = sqlx::query("INSERT INTO social_like_sync(post_id,owner,author,enabled,issued_at,payload,signature) SELECT ?,?,?,?,?,?,? WHERE (SELECT COUNT(*) FROM social_like_sync)<10000 OR EXISTS(SELECT 1 FROM social_like_sync WHERE post_id=? AND owner=?) ON CONFLICT(post_id,owner) DO UPDATE SET enabled=excluded.enabled,issued_at=excluded.issued_at,payload=excluded.payload,signature=excluded.signature,state='pending',attempts=0,next_attempt=0 WHERE social_like_sync.issued_at < excluded.issued_at")
+                .bind(&post_id).bind(&owner).bind(like_author.ok_or_else(bad)?).bind(enabled).bind(intent.issued_at as i64).bind(&input.payload).bind(&input.signature).bind(&post_id).bind(&owner).execute(&mut *tx).await?;
+            if result.rows_affected() != 1 {
+                let exists: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM social_like_sync WHERE post_id=? AND owner=?",
+                )
+                .bind(&post_id)
+                .bind(&owner)
+                .fetch_one(&mut *tx)
+                .await?;
+                return Err(if exists == 1 {
+                    ApiError(
+                        StatusCode::CONFLICT,
+                        "A newer like change already exists. Review and sign again.",
+                    )
+                } else {
+                    ApiError(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "Like synchronization limit reached",
+                    )
+                });
+            }
+        }
         Action::Follow { target, enabled } => {
             let previous: Option<i64> = sqlx::query_scalar(
                 "SELECT issued_at FROM social_follow_versions WHERE owner=? AND target=?",
@@ -374,6 +422,28 @@ async fn commit(
             let path = post_record.ok_or_else(unavailable)?;
             sqlx::query("INSERT INTO social_posts(id,author,title,distribution,created_at,published,object_path,audience_scope) VALUES(?,?,?,?,?,1,?,?)")
                 .bind(&id).bind(&owner).bind(if post.distribution!=Distribution::Broadcast {"Encrypted post"}else{&post.title}).bind(if post.distribution==Distribution::Broadcast {"broadcast"}else{"directed"}).bind(now()).bind(path).bind(serde_json::to_value(&post.distribution).map_err(|_|bad())?.as_str().ok_or_else(bad)?).execute(&mut *tx).await?;
+            let level = match post.distribution {
+                Distribution::Broadcast => "public",
+                Distribution::Following => "following",
+                Distribution::Followers => "followers",
+                _ => "directed",
+            };
+            sqlx::query("INSERT INTO social_post_access(post_id,level) VALUES(?,?)")
+                .bind(&id)
+                .bind(level)
+                .execute(&mut *tx)
+                .await?;
+            if level == "directed" {
+                for recipient in &post.recipients {
+                    sqlx::query(
+                        "INSERT INTO social_post_access_recipients(post_id,viewer) VALUES(?,?)",
+                    )
+                    .bind(&id)
+                    .bind(wallet(*recipient))
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
             for (position, file) in post.media.iter().enumerate() {
                 sqlx::query(
                     "INSERT INTO social_post_media(post_id,media_id,position) VALUES(?,?,?)",
@@ -548,12 +618,11 @@ async fn timeline(
     let prefs = get_preferences(&state, &owner).await?;
     let rows=sqlx::query("WITH available AS (
  SELECT p.id,p.author,p.title,p.audience_scope,p.created_at,p.published,0 AS remote
- FROM social_posts p WHERE
+ FROM social_posts p LEFT JOIN social_post_access a ON a.post_id=p.id WHERE
  ((? AND p.author=?) OR (NOT ? AND p.published=1 AND
- (p.distribution='broadcast' OR EXISTS(SELECT 1 FROM social_recipients r WHERE r.post_id=p.id AND r.recipient=?)) AND
- ((? AND p.distribution='broadcast') OR (? AND EXISTS(SELECT 1 FROM social_follows f WHERE f.owner=? AND f.target=p.author)) OR
+ ((? AND a.level='public') OR (? AND EXISTS(SELECT 1 FROM social_follows f WHERE f.owner=? AND f.target=p.author)) OR
  (? AND EXISTS(SELECT 1 FROM social_follows f WHERE f.owner=p.author AND f.target=?)) OR
- (? AND EXISTS(SELECT 1 FROM social_recipients r WHERE r.post_id=p.id AND r.recipient=?))) AND
+ (? AND (EXISTS(SELECT 1 FROM social_post_access_recipients r WHERE r.post_id=p.id AND r.viewer=?) OR EXISTS(SELECT 1 FROM social_inbox i WHERE i.post_id=p.id AND i.recipient=? AND json_extract(i.notice,'$.distribution')!='broadcast')))) AND
  NOT EXISTS(SELECT 1 FROM social_blocks b WHERE b.owner=? AND b.target=p.author)))
  UNION ALL
  SELECT i.post_id,i.author,COALESCE(NULLIF(json_extract(i.notice,'$.title'),''),'Encrypted post'),json_extract(i.notice,'$.distribution'),i.created_at,1,1
@@ -564,18 +633,36 @@ async fn timeline(
  (? AND EXISTS(SELECT 1 FROM social_follows f WHERE f.owner=i.author AND f.target=i.recipient)) OR
  (? AND json_extract(i.notice,'$.distribution')!='broadcast'))
  ) SELECT * FROM available ORDER BY created_at DESC,id DESC LIMIT 50 OFFSET ?")
-        .bind(query.mine).bind(&owner).bind(query.mine).bind(&owner)
-        .bind(prefs.broadcasts).bind(prefs.following).bind(&owner).bind(prefs.followers).bind(&owner).bind(prefs.direct).bind(&owner).bind(&owner)
+        .bind(query.mine).bind(&owner).bind(query.mine)
+        .bind(prefs.broadcasts).bind(prefs.following).bind(&owner).bind(prefs.followers).bind(&owner).bind(prefs.direct).bind(&owner).bind(&owner).bind(&owner)
         .bind(query.mine).bind(&owner).bind(&state.config.peer_id).bind(prefs.broadcasts).bind(prefs.following).bind(prefs.followers).bind(prefs.direct)
         .bind(query.offset.min(10000)).fetch_all(&state.pool).await?;
     let mut posts = Vec::new();
+    let mut unavailable_posts = 0;
     for row in &rows {
         let id: String = row.get("id");
-        let content = if row.get::<bool, _>("remote") {
-            delivery::remote_read(&state, &id, &owner).await?
+        let remote: bool = row.get("remote");
+        let content = if remote {
+            delivery::remote_read(&state, &id, &owner).await
         } else {
-            let full = load(&state, &id, &owner).await?;
-            readable(&state, &full, &id).await?
+            match load(&state, &id, &owner).await {
+                Ok(full) => readable(&state, &full, &id).await,
+                Err(error) => Err(error),
+            }
+        };
+        let content = match content {
+            Ok(content) => content,
+            Err(ApiError(StatusCode::NOT_FOUND | StatusCode::FORBIDDEN, _)) => continue,
+            Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE
+                | StatusCode::GATEWAY_TIMEOUT
+                | StatusCode::REQUEST_TIMEOUT,
+                _,
+            )) if remote => {
+                unavailable_posts += 1;
+                continue;
+            }
+            Err(error) => return Err(error),
         };
         let preview = content.0["intent"]["action"]["post"].clone();
         let mut delivery = serde_json::Map::new();
@@ -596,7 +683,7 @@ async fn timeline(
         posts.push(json!({"id":id,"author":row.get::<String, _>("author"),"title":row.get::<String, _>("title"),"distribution":row.get::<String, _>("audience_scope"),"created_at":row.get::<i64, _>("created_at"),"published":row.get::<bool, _>("published"),"preview":preview,"delivery":delivery}));
     }
     Ok(Json(
-        json!({"posts":posts,"scope":"nas_inbox","network_delivery":if service(&state)?.runtime.network().is_some_and(|h|h.status.running.load(std::sync::atomic::Ordering::Relaxed)){"running"}else{"local_only"}}),
+        json!({"posts":posts,"unavailable_posts":unavailable_posts,"scope":"nas_inbox","network_delivery":if service(&state)?.runtime.network().is_some_and(|h|h.status.running.load(std::sync::atomic::Ordering::Relaxed)){"running"}else{"local_only"}}),
     ))
 }
 
@@ -613,23 +700,7 @@ async fn load(
         .fetch_optional(&state.pool)
         .await?
         .ok_or_else(forbidden)?;
-    if row.get::<String, _>("author") != viewer {
-        if !row.get::<bool, _>("published") {
-            return Err(forbidden());
-        }
-        if row.get::<String, _>("distribution") == "directed" {
-            let count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM social_recipients WHERE post_id=? AND recipient=?",
-            )
-            .bind(id)
-            .bind(viewer)
-            .fetch_one(&state.pool)
-            .await?;
-            if count != 1 {
-                return Err(forbidden());
-            }
-        }
-    }
+    access::ensure(state, id, viewer).await?;
     Ok(row)
 }
 fn load_object(row: &sqlx::sqlite::SqliteRow) -> Result<StoredPost, ApiError> {
@@ -687,14 +758,26 @@ fn decode_content(
         .map_err(|_| unavailable())?;
     Ok(bytes)
 }
+#[derive(Deserialize, Default)]
+struct ReadPost {
+    author: Option<String>,
+}
 async fn read_post(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Query(query): Query<ReadPost>,
 ) -> Result<Json<Value>, ApiError> {
     let viewer = owner(&state, headers).await?;
     if delivery::remote_row(&state, &id, &viewer).await?.is_some() {
         return delivery::remote_read(&state, &id, &viewer).await;
+    }
+    let local: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM social_posts WHERE id=?)")
+        .bind(&id)
+        .fetch_one(&state.pool)
+        .await?;
+    if !local && let Some(author) = query.author {
+        return delivery::open_shared(&state, &id, &viewer, &wallet(address(&author)?)).await;
     }
     let row = load(&state, &id, &viewer).await?;
     readable(&state, &row, &id).await
@@ -725,3 +808,7 @@ mod media;
 
 #[cfg(test)]
 mod tests;
+
+mod likes;
+
+mod access;

@@ -16,8 +16,8 @@ NAS 节点通信协议的共享 Rust 库，依据[通信草案](../../docs/node-
 | `event` | EOA EIP-712 公开帖子／关注／点赞签名验证、事件 ID、语义去重键 |
 | `receipt` | 按用户服务密钥签署保存声明，验证目标用户、NAS、事件和保存范围 |
 | `file` | 2 GiB 内文件清单、最大 256 KiB 块、每页 128 个块哈希、页与块完整性检查 |
-| `social` | 明确的 Publish／Follow 用户动作，绑定受众、价格、NAS、nonce 和有效期的独立 EIP-712 签名 |
-| `delivery` | 应用级范围推送 v1：通知、加密正文、关注同步、媒体授权／块、公开补漏及有界 ACK；节点启动边界见[推送说明](../../docs/scoped-delivery.md) |
+| `social` | 明确的 Publish／Follow／Like 用户动作，绑定受众、帖子引用、NAS、nonce 和有效期的独立 EIP-712 签名 |
+| `delivery` | 应用级范围推送 v3：通知、加密正文、关注同步、媒体授权／块、公开补漏及有界 ACK；节点启动边界见[推送说明](../../docs/scoped-delivery.md) |
 | `encryption` | AES-256-GCM 正文与 RFC 9180 HPKE 内容密钥封装、随机密钥和 X25519 密钥对 |
 
 用户上下文消息只校验结构和能力名称。`grant` 暂为有界 opaque bytes，**不表示已验证钱包授权**。
@@ -30,7 +30,7 @@ NAS 节点通信协议的共享 Rust 库，依据[通信草案](../../docs/node-
 2. 按受信配置构造 `NetworkScope` 和 `Codec`，先调用 `decode_length` 校验长度，再分配／读取帧；完整缓冲区可直接用 `decode`。返回的 consumed 长度允许一次缓冲多个帧。
 3. 交换 Hello，调用 `handshake::negotiate`，随后每帧都做 codec 校验和 `Negotiated::check_frame`。Hello 中的 nonce 由调用方使用安全随机源生成，每个连接重新生成，不能复用。
 4. 节点查询当前链上 NAS 绑定，验证钱包签署的服务授权、会话持钥证明、撤销情况、本地接纳和用户策略。验证成功后才将 `context_id` 放入当前连接的用户上下文表；仅有一个格式正确的 context ID 不构成授权。
-5. 源节点创建帖子投递任务或向其他用户提供内容服务前，必须验证用户针对该内容及发布范围的明确发布确认，并持久化确认状态。旧 `PublicEvent` 不自动构成发布确认；本地图文／视频 API 使用独立 `social::Intent` 的 `Publish` 动作并事务性消费一次性挑战。delivery v2 在接收正文时复核完整 Intent 和原始签名；移除价格、市场合约及付费密钥字段，只接受当前无价格帖子结构，不兼容旧签名或旧缓存；本文原型 Frame/grant 流程尚未整体接入。接收端仍需核对作者签名、offer 作者／ID、上下文源用户、接收范围和黑名单；库不维护全局去重缓存。
+5. 源节点创建帖子投递任务或向其他用户提供内容服务前，必须验证用户针对该内容及发布范围的明确发布确认，并持久化确认状态。旧 `PublicEvent` 不自动构成发布确认；本地图文／视频 API 使用独立 `social::Intent` 的 `Publish` 动作并事务性消费一次性挑战。delivery v4 在接收正文时复核完整 Intent 和原始签名；移除价格、市场合约及付费密钥字段，只接受当前无价格帖子结构，不兼容旧签名或旧缓存；本文原型 Frame/grant 流程尚未整体接入。接收端仍需核对作者签名、offer 作者／ID、上下文源用户、接收范围和黑名单；库不维护全局去重缓存。
 6. 请求对象和块时检查当前用户的访问权。`ChunkData.chunk_id` 自校验不能替代清单校验，必须再用 `FileManifest::verify_chunk` 匹配预期页／块索引与长度。全部收齐后流式验证整个文件的哈希和长度。
 7. 文件及数据库真正持久化后才创建回执，使用用户服务密钥签名。接收回执时，公钥必须来自独立验证的有效授权，还需核对 `service_grant_ref` 和当时的绑定；中继签名或回执签名本身不能证明磁盘已经保存。
 
@@ -74,3 +74,7 @@ cargo clippy -p red-leaves-protocol --all-targets --locked -- -D warnings
 当前测试包括内存中的双 NAS 报文／事件／回执交换，不是实际 NAT 穿透、中继或多进程落盘测试。
 
 本地 `social::PostDraft` 新增可省略的 `media` 数组（最多 9 张图片或 1 个视频，签名绑定上传 ID、MIME、大小和 SHA-256 multihash）；无媒体时省略该字段，保留旧文本载荷的规范字节与 ID。`Distribution` 增加 following／followers／friends，接收者快照仍显式包含在签名内。旧实现应拒绝不支持的字段／范围，不能退化为公开广播。这些附件引用用于 NAS HTTP，不能替代 P2P 的分块清单、能力协商或密钥交付格式。
+
+业务 Like 动作与 delivery v4 的 Like／Likes 接入边界见[点赞同步](../../docs/likes.md)。原型 PublicEvent 的 Like 不等同于业务接口，未将两个签名域混用。
+
+作品发布后支持五档访问权限；新拉取及点赞同步使用最新权限，其他 NAS 的已缓存数据不受影响。评论尚未实现。见[作品访问权限](../../docs/post-access.md)。

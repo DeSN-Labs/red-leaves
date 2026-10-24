@@ -61,7 +61,7 @@ try {
  async function action(node,action){
   const prepared=await request(node,"social/prepare",{action});assert.equal(prepared.status,200,JSON.stringify(prepared.body));const value=prepared.body,intent=value.intent;
   assert(actionsMatch(intent.action,action));
-  const typedAction=action.action==="publish"?{action:"publish",post:{...intent.action.post,recipients:intent.action.post.recipients.map(v=>new Uint8Array(v))}}:{...intent.action,target:new Uint8Array(intent.action.target)};
+  const typedAction=action.action==="publish"?{action:"publish",post:{...intent.action.post,recipients:intent.action.post.recipients.map(v=>new Uint8Array(v))}}:action.action==="follow"?{...intent.action,target:new Uint8Array(intent.action.target)}:{...intent.action,post_id:new Uint8Array(intent.action.post_id)};
   const encoded=encodeCanonical({...intent,scope:{...intent.scope,registry_contract:new Uint8Array(intent.scope.registry_contract)},actor:new Uint8Array(intent.actor),nonce:new Uint8Array(intent.nonce),action:typedAction});assert.equal(bytesToHex(encoded),value.payload);assert.equal(keccak256(encoded),value.payload_hash);
   const signature=await wallets[node.index].signTypedData({domain:{name:"RedLeaves",version:"1",chainId:84532,verifyingContract:registry.address},types:{SocialAction:[{name:"payloadHash",type:"bytes32"}]},primaryType:"SocialAction",message:{payloadHash:value.payload_hash}});
   const committed=await request(node,"social/commit",{payload:value.payload,signature});assert.equal(committed.status,200,JSON.stringify(committed.body));return committed.body;
@@ -82,8 +82,29 @@ try {
  await until(()=>has(b,publicPost.id),"public reception by following");await until(()=>has(c,publicPost.id),"public reception by broadcast preference");
  const update=await Promise.race([reader.read(),pause(10000).then(()=>{throw new Error("Missing live inbox update");})]);assert(new TextDecoder().decode(update.value).includes("event: update"));sseAbort.abort();await reader.cancel().catch(()=>{});
  console.log("Public delivery and live SSE passed.");
+ const postBytes=id=>Array.from(Buffer.from(id,"hex"));
+ async function likes(node,id){const result=await request(node,`posts/${id}/likes`);assert.equal(result.status,200,JSON.stringify(result.body));return result.body;}
+ async function like(node,id,enabled){return action(node,{action:"like",post_id:postBytes(id),enabled});}
+ assert.equal((await likes(b,publicPost.id)).count,0);
+ await like(b,publicPost.id,true);
+ await until(async()=>{assert.equal((await likes(a,publicPost.id)).count,1);assert.equal((await likes(b,publicPost.id)).liked,true);assert.equal((await likes(c,publicPost.id)).count,1);},"authoritative cross-NAS like");
+ await like(b,publicPost.id,false);
+ await until(async()=>{assert.equal((await likes(a,publicPost.id)).count,0);assert.equal((await likes(b,publicPost.id)).liked,false);},"cross-NAS unlike");
+ console.log("Author aggregation and on-demand like pulls passed.");
  for(const scope of ["following","followers","friends"]){const post=await publish(scope,[b]);await until(()=>has(b,post.id),scope);await absent(c,post.id);assert.equal((await request(c,`posts/${post.id}`)).status,404);}
  const direct=await publish("directed",[c]);await until(()=>has(c,direct.id),"explicit recipient");await absent(b,direct.id);
+ await like(c,direct.id,true);await until(async()=>assert.equal((await likes(a,direct.id)).count,1),"directed like");
+ assert.equal((await request(b,`posts/${direct.id}/likes`)).status,404);
+ await request(a,`posts/${direct.id}/likes/access`,{target:c.owner,allowed:false});
+ assert.equal((await request(c,`posts/${direct.id}/likes`)).status,404);
+ assert.equal((await request(c,`posts/${direct.id}`)).status,200);
+ await request(a,`posts/${direct.id}/likes/access`,{target:c.owner,allowed:true});
+ assert.equal((await likes(c,direct.id)).count,1);
+ await request(a,"social/blocks",{target:c.owner,blocked:true});
+ assert.equal((await request(c,`posts/${direct.id}/likes`)).status,404);
+ await request(a,"social/blocks",{target:c.owner,blocked:false});
+ assert.equal((await likes(c,direct.id)).count,1);
+ console.log("Latest author permissions and revoked like access passed.");
  const blocked=await request(c,"social/blocks",{target:a.owner,blocked:true});assert.equal(blocked.status,200);
  const hidden=await publish();await until(()=>has(b,hidden.id),"unblocked receiver");await pause(1000);await absent(c,hidden.id);
  await request(c,"social/blocks",{target:a.owner,blocked:false});
@@ -100,15 +121,43 @@ try {
  const mediaResponse=await fetch(`${b.api}/api/posts/${photo.id}/media/${media.id}`,{headers:{Authorization:`Bearer ${b.token}`}});assert.equal(mediaResponse.status,200,await mediaResponse.clone().text());assert.deepEqual(Buffer.from(await mediaResponse.arrayBuffer()),image);
  assert.equal((await request(c,`posts/${photo.id}`)).status,404);
  console.log("Directed content and encrypted media passed.");
+ async function access(id,level,recipients=[]){const result=await request(a,`posts/${id}/access`,{level,recipients:recipients.map(node=>node.owner)});assert.equal(result.status,200,JSON.stringify(result.body));}
+ const restricted=await publish("directed",[b]);await until(()=>has(b,restricted.id),"initial cached private copy");
+ await access(restricted.id,"none");
+ assert.equal((await request(b,`posts/${restricted.id}`)).status,200,"existing cache must remain readable");
+ assert.equal((await request(b,`posts/${restricted.id}/likes`)).status,404,"cached body must not authorize interaction pulls");
+
+ assert.equal((await request(c,`posts/${restricted.id}?author=${a.owner}`)).status,404,"new fetch must be denied");
+ await access(restricted.id,"followers");assert.equal((await request(b,`posts/${restricted.id}/likes`)).status,200);assert.equal((await request(c,`posts/${restricted.id}?author=${a.owner}`)).status,404);
+ await access(restricted.id,"following");assert.equal((await request(b,`posts/${restricted.id}/likes`)).status,200);assert.equal((await request(c,`posts/${restricted.id}?author=${a.owner}`)).status,404);
+ await access(restricted.id,"directed",[c]);
+ assert.equal((await request(c,`posts/${restricted.id}?author=${a.owner}`)).status,200,"new recipient can fetch beyond original signed delivery list");
+ assert.equal((await request(c,`posts/${restricted.id}/likes`)).status,200);assert.equal((await request(b,`posts/${restricted.id}/likes`)).status,404);
+ assert.equal((await request(b,`posts/${restricted.id}`)).status,200);
+ await access(restricted.id,"public");assert.equal((await request(b,`posts/${restricted.id}/likes`)).status,200);
+ const expanded=await publish("directed",[b]);await until(()=>has(b,expanded.id),"second private copy");await access(expanded.id,"public");await until(()=>has(c,expanded.id),"formerly encrypted post becomes public");
+ await access(photo.id,"none");
+ assert.equal((await request(b,`posts/${photo.id}`)).status,200);
+ assert.equal((await fetch(`${b.api}/api/posts/${photo.id}/media/${media.id}`,{headers:{Authorization:`Bearer ${b.token}`}})).status,404);
+ console.log("All five access levels passed; existing caches survive while new fetches, media and likes use current permissions.");
+
  await stop(b.process);
  const offline=await publish("directed",[b]);
  await until(async()=>{const progress=(await request(a,`posts/${offline.id}/delivery`)).body;assert(progress.targets[0].attempts>0);assert.equal(progress.targets[0].state,"retrying");},"offline retry");
  await stop(a.process);await a.restart();await b.restart();
  await until(async()=>{assert.equal((await info(a)).peer_id,a.peer);assert.equal((await info(b)).peer_id,b.peer);await has(b,offline.id);},"restart delivery",70);
  await until(async()=>{const progress=(await request(a,`posts/${offline.id}/delivery`)).body;assert.equal(progress.targets[0].state,"delivered");},"receiver save acknowledgment");
+ assert.equal((await likes(b,offline.id)).count,0);
+ await stop(a.process);
+ await like(b,offline.id,true);
+ assert.equal((await request(b,`posts/${offline.id}/likes`)).status,503);
+ await stop(b.process);await b.restart();
+ await a.restart();
+ await until(async()=>{assert.equal((await likes(a,offline.id)).count,1);const value=await likes(b,offline.id);assert.equal(value.count,1);assert.equal(value.liked,true);assert.equal(value.pending,null);},"durable offline like synchronization",90);
+ console.log("Offline like queue survives restart; no stale statistics fallback.");
  await stop(a.process);
  const cached=await request(b,`posts/${offline.id}`);assert.equal(cached.status,200);assert.equal(cached.body.intent.action.post.body,"Signed content over a relay circuit");
- console.log(`Delivery integration passed: ${lan?.direct ? "direct LAN connections" : "relay circuits"}, all scopes, follow synchronization, live SSE, reception/block filters, audience isolation, encrypted media chunks, offline retry, durable restart and offline cached reading.`);
+ console.log(`Delivery integration passed: ${lan?.direct ? "direct LAN connections" : "relay circuits"}, all scopes, follow synchronization, author-aggregated likes with current permissions and offline recovery, live SSE, reception/block filters, audience isolation, encrypted media chunks, offline retry, durable restart and offline cached reading.`);
  if(lan)await lan.report();
 } catch(error) {
  for(const process of children){if(process.log) console.error(process.log.slice(-3000));}

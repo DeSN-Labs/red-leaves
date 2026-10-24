@@ -30,7 +30,11 @@ async fn serve_content(
         signature: stored.signature,
     })
 }
+#[derive(Clone)]
 struct MediaGrant {
+    post_id: String,
+    viewer: String,
+    revision: i64,
     peer: PeerId,
     path: String,
     size: u64,
@@ -38,13 +42,13 @@ struct MediaGrant {
 }
 type PeerRates = HashMap<PeerId, (i64, usize, usize)>;
 #[derive(Clone)]
-pub(super) struct Server {
+pub(in crate::api::posts) struct Server {
     state: AppState,
     grants: Arc<Mutex<HashMap<String, MediaGrant>>>,
     rate: Arc<Mutex<PeerRates>>,
 }
 impl Server {
-    pub(super) fn new(state: AppState) -> Self {
+    pub(in crate::api::posts) fn new(state: AppState) -> Self {
         Self {
             state,
             grants: Arc::new(Mutex::new(HashMap::new())),
@@ -110,6 +114,7 @@ impl Server {
         let mut nonce = vec![0; 12];
         input.read_exact(&mut nonce).map_err(|_| unavailable())?;
         let token = identity::secret().map_err(internal)?;
+        let revision = super::super::access::revision(state, &id).await?;
         let mut grants = self.grants.lock().map_err(|_| unavailable())?;
         grants.retain(|_, g| g.expires > now());
         if grants.len() >= 64 || grants.values().filter(|g| g.peer == remote).count() >= 2 {
@@ -121,6 +126,9 @@ impl Server {
         grants.insert(
             token.clone(),
             MediaGrant {
+                post_id: id,
+                viewer,
+                revision,
                 peer: remote,
                 path,
                 size: file.size + 16,
@@ -134,14 +142,23 @@ impl Server {
             size: file.size + 16,
         })
     }
-    fn media_chunk(
+    async fn media_chunk(
         &self,
         remote: PeerId,
         token: &str,
         offset: u64,
     ) -> Result<NetResponse, ApiError> {
-        let mut grants = self.grants.lock().map_err(|_| unavailable())?;
-        let grant = grants.get(token).ok_or_else(forbidden)?;
+        let grant = self
+            .grants
+            .lock()
+            .map_err(|_| unavailable())?
+            .get(token)
+            .cloned()
+            .ok_or_else(forbidden)?;
+        super::super::access::ensure(&self.state, &grant.post_id, &grant.viewer).await?;
+        if super::super::access::revision(&self.state, &grant.post_id).await? != grant.revision {
+            return Err(forbidden());
+        }
         if grant.peer != remote
             || grant.expires <= now()
             || offset >= grant.size
@@ -155,11 +172,11 @@ impl Server {
         let mut bytes = vec![0; (grant.size - offset).min(CHUNK as u64) as usize];
         file.read_exact(&mut bytes).map_err(|_| unavailable())?;
         if offset + bytes.len() as u64 == grant.size {
-            grants.remove(token);
+            self.grants.lock().map_err(|_| unavailable())?.remove(token);
         }
         Ok(NetResponse::Chunk { bytes })
     }
-    pub(super) async fn request(
+    pub(in crate::api::posts) async fn request(
         &self,
         remote: PeerId,
         request: NetRequest,
@@ -202,17 +219,36 @@ impl Server {
             NetRequest::Follow { payload, signature } => {
                 receive_follow(state, remote, &payload, &signature).await
             }
+            NetRequest::Like { payload, signature } => {
+                likes::receive(state, remote, &payload, &signature).await
+            }
+            NetRequest::Likes { id, viewer } => likes::serve(state, remote, id, viewer).await,
+            NetRequest::Access { id, viewer } => {
+                authorize_peer(state, viewer, remote).await?;
+                let id = hex::encode(id.as_bytes());
+                let row = load(state, &id, &wallet(viewer)).await?;
+                if profile(state, &row.get::<String, _>("author")).await?.peer
+                    != state.config.peer_id
+                {
+                    return Err(forbidden());
+                }
+                Ok(NetResponse::Access {
+                    revision: super::super::access::revision(state, &id).await? as u64,
+                })
+            }
             NetRequest::MediaStart {
                 id,
                 viewer,
                 media_id,
             } => self.media_start(remote, id, viewer, media_id).await,
-            NetRequest::MediaChunk { token, offset } => self.media_chunk(remote, &token, offset),
+            NetRequest::MediaChunk { token, offset } => {
+                self.media_chunk(remote, &token, offset).await
+            }
             NetRequest::Sync { offset } => {
                 if offset > 224 {
                     return Err(bad());
                 }
-                let ids:Vec<String>=sqlx::query_scalar("SELECT id FROM social_posts WHERE published=1 AND distribution='broadcast' ORDER BY created_at DESC,id DESC LIMIT 32 OFFSET ?").bind(offset).fetch_all(&state.pool).await?;
+                let ids:Vec<String>=sqlx::query_scalar("SELECT id FROM social_posts WHERE published=1 AND id IN (SELECT post_id FROM social_post_access WHERE level='public') ORDER BY created_at DESC,id DESC LIMIT 32 OFFSET ?").bind(offset).fetch_all(&state.pool).await?;
                 let mut notices = vec![];
                 for id in ids {
                     notices.push(notice(state, &id).await?);

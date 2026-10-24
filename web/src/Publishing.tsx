@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
-import { ImagePlus, Video, FileText, X, ChevronLeft, ChevronRight } from "lucide-react";
-import { nasApi, nasBlob, nasUpload, shortAddress, watchNasChanges } from "./wallet";
+import { ImagePlus, Video, FileText, Heart, X, ChevronLeft, ChevronRight } from "lucide-react";
+import { nasApi, nasBlob, nasUpload, NasRequestError, shortAddress, watchNasChanges } from "./wallet";
 import { addressBytes, audienceWallets, submitAction, type Draft, type Distribution, type Media, type Relationships, type PostSummary, type PostDetail, type Preferences } from "./content";
 
 const scopes: Record<Distribution, string> = { broadcast: "Network broadcast", following: "People I follow", followers: "People who follow me", friends: "Friends (mutual follows)", directed: "Specific people" };
@@ -20,9 +20,10 @@ function MediaView({ file, path, controls = false }: { file: Media; path: string
   }, [path]);
   return <div className="media-view" ref={container}>{error ? <p className="media-error" role="alert">{error}</p> : !url ? <span className="media-loading" role="status">Loading media…</span> : file.mime.startsWith("video/") ? <video src={url} controls={controls} preload="metadata" playsInline aria-label="Post video" /> : <img src={url} alt="Post attachment" loading="lazy" />}</div>;
 }
-function Detail({ post, value, error, close }: { post: PostSummary; value: PostDetail; error: string; close: () => void }) {
+function Detail({ owner, post, value, error, close }: { owner: string; post: PostSummary; value: PostDetail; error: string; close: () => void }) {
   const dialog = useRef<HTMLDialogElement>(null), [index, setIndex] = useState(0);
   const draft = value.intent?.action.post, files = draft?.media ?? [];
+  const [accessRevision, setAccessRevision] = useState(0);
   useEffect(() => { const node = dialog.current; node?.showModal(); return () => { node?.close(); }; }, []);
   return <dialog className="note-dialog" ref={dialog} onCancel={close} onClick={event => { if (event.target === event.currentTarget) close(); }} aria-label="Post details">
     <button className="note-close icon-button" aria-label="Close post" onClick={close}><X size={22} /></button>
@@ -30,13 +31,83 @@ function Detail({ post, value, error, close }: { post: PostSummary; value: PostD
       {files.length > 0 && <div className="note-gallery"><MediaView key={files[index].id} file={files[index]} path={`posts/${post.id}/media/${files[index].id}`} controls />
         {files.length > 1 && <div className="gallery-navigation"><button className="icon-button" aria-label="Previous image" disabled={index === 0} onClick={() => setIndex(index - 1)}><ChevronLeft /></button><span>{index + 1} / {files.length}</span><button className="icon-button" aria-label="Next image" disabled={index === files.length - 1} onClick={() => setIndex(index + 1)}><ChevronRight /></button></div>}
       </div>}
-      <div className="note-copy"><p className="note-author">{shortAddress(post.author)}</p><span className="registration-badge">{scopes[post.distribution as Distribution] ?? post.distribution}</span><h2>{draft?.title ?? post.title}</h2>
+      <div className="note-copy"><p className="note-author">{shortAddress(post.author)}</p><span className="registration-badge">Initial distribution: {scopes[post.distribution as Distribution] ?? post.distribution}</span><h2>{draft?.title ?? post.title}</h2>
         {error && <p className="error" role="alert">{error}</p>}
         {draft && <p className="post-body">{draft.body}</p>}
         <time>{new Date(post.created_at * 1000).toLocaleString()}</time>
+        {owner.toLowerCase() === post.author.toLowerCase() && <AccessPolicy post={post} changed={() => setAccessRevision(value => value + 1)} />}
+        <Likes key={accessRevision} owner={owner} post={post} />
       </div>
     </div>
   </dialog>;
+}
+type AccessLevel = "none" | "followers" | "following" | "directed" | "public";
+const accessLevels: Record<AccessLevel, string> = { none: "Only me (no one else)", followers: "My followers", following: "People I follow", directed: "Specific people", public: "Everyone" };
+function AccessPolicy({ post, changed }: { post: PostSummary; changed: () => void }) {
+  const [level, setLevel] = useState<AccessLevel>("none"), [recipients, setRecipients] = useState("");
+  const [ready, setReady] = useState(false), [busy, setBusy] = useState(false), [error, setError] = useState(""), [message, setMessage] = useState("");
+  useEffect(() => {
+    let active = true;
+    void nasApi<{ level: AccessLevel; recipients: string[] }>(`posts/${post.id}/access`).then(policy => { if (active) { setLevel(policy.level); setRecipients(policy.recipients.join("\n")); setReady(true); } }).catch(cause => { if (active) setError(explain(cause)); });
+    return () => { active = false; };
+  }, [post.id]);
+  async function save() {
+    setBusy(true); setError(""); setMessage("");
+    try {
+      const wallets = level === "directed" ? recipients.split(/[\s,]+/).filter(Boolean) : [];
+      for (const wallet of wallets) addressBytes(wallet);
+      await nasApi(`posts/${post.id}/access`, { level, recipients: wallets });
+      setMessage("Access permissions saved. New fetches and interaction requests use these permissions. Existing NAS copies remain readable."); changed();
+    } catch (cause) { setError(explain(cause)); } finally { setBusy(false); }
+  }
+  return <details className="post-access"><summary>Work access permissions</summary>
+    <label>Who can access this work?<select value={level} disabled={!ready || busy} onChange={event => setLevel(event.target.value as AccessLevel)}>{Object.entries(accessLevels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+    {level === "directed" && <label>Wallet addresses (1–32)<textarea rows={3} value={recipients} disabled={!ready || busy} onChange={event => setRecipients(event.target.value)} /></label>}
+    <p>Following permissions use current relationships known to your NAS. You retain access. Copies already delivered cannot be recalled.</p>
+    <button className="button demo" disabled={!ready || busy} onClick={() => void save()}>Save access permissions</button>
+    {message && <p role="status">{message}</p>}{error && <p className="error" role="alert">{error}</p>}
+    <p>Share this post ID and your wallet address with permitted readers:</p><p className="key-value">{post.id}</p><p className="key-value">{post.author}</p>
+  </details>;
+}
+type LikeSummary = { count: number; liked: boolean; pending: { enabled: boolean; state: string } | null };
+function Likes({ owner, post }: { owner: string; post: PostSummary }) {
+  const [summary, setSummary] = useState<LikeSummary | null>(null), [busy, setBusy] = useState(false), [denied, setDenied] = useState(false);
+  const [error, setError] = useState(""), [message, setMessage] = useState(""), [target, setTarget] = useState("");
+  const alive = useRef(true), fetchRevision = useRef(0);
+  async function refresh() {
+    const current = ++fetchRevision.current;
+    setSummary(null);
+    try {
+      const value = await nasApi<LikeSummary>(`posts/${post.id}/likes`);
+      if (alive.current && current === fetchRevision.current) { setSummary(value); setError(""); setDenied(false); }
+    } catch (cause) { if (alive.current && current === fetchRevision.current) { setSummary(null); setError(explain(cause)); if (cause instanceof NasRequestError && (cause.status === 404 || cause.status === 403)) setDenied(true); } }
+  }
+  useEffect(() => { alive.current = true; void refresh(); return () => { alive.current = false; fetchRevision.current++; }; }, [post.id, owner]);
+  const liked = summary?.pending && summary.pending.state !== "denied" ? summary.pending.enabled : summary?.liked;
+  async function run(task: () => Promise<void>) {
+    setBusy(true); setError(""); setMessage("");
+    try { await task(); } catch (cause) { if (alive.current) setError(explain(cause)); }
+    finally { if (alive.current) setBusy(false); }
+  }
+  return <section className="post-likes" aria-label="Post likes">
+    <div className="binding-actions">
+      <button className="button demo" disabled={busy || denied} aria-pressed={!!liked} onClick={() => void run(async () => {
+        await submitAction(owner, { action: "like", post_id: Array.from(Uint8Array.from(post.id.match(/../g)!, byte => parseInt(byte, 16))), enabled: !liked });
+        if (alive.current) setMessage("Like change saved to your NAS. Delivery to the author is pending until confirmed.");
+        await refresh();
+      })}><Heart size={17} fill={liked ? "currentColor" : "none"} />{!summary ? "Sign like" : liked ? "Unlike" : "Like"}{summary ? ` · ${summary.count}` : ""}</button>
+      <button className="button demo" disabled={busy} onClick={() => void run(refresh)}>Refresh likes</button>
+    </div>
+    {summary && <p>Author statistics at last fetch. {summary.pending ? `Your change: ${summary.pending.state}.` : "Your state is confirmed by the author."}</p>}
+    {message && <p role="status">{message}</p>}{error && <p className="error" role="alert">{error}</p>}
+    {owner.toLowerCase() === post.author.toLowerCase() && <details><summary>Likes access</summary>
+      <p>Restrict a wallet from submitting or fetching likes. Restoring access still requires current post audience permissions.</p>
+      <label>Wallet address<input value={target} disabled={busy} onChange={event => setTarget(event.target.value)} /></label>
+      <div className="binding-actions">{[false, true].map(allowed => <button className="button demo" key={String(allowed)} disabled={busy || !target} onClick={() => void run(async () => {
+        addressBytes(target); await nasApi(`posts/${post.id}/likes/access`, { target, allowed }); setMessage("Likes access updated. Future requests use the new permissions.");
+      })}>{allowed ? "Restore likes access" : "Restrict likes access"}</button>)}</div>
+    </details>}
+  </section>;
 }
 export function Publishing({ owner, page }: { owner: string; page: "publish" | "feed" | "relationships" }) {
   const [title, setTitle] = useState(""), [body, setBody] = useState("");
@@ -50,18 +121,19 @@ export function Publishing({ owner, page }: { owner: string; page: "publish" | "
   const [relations, setRelations] = useState<Relationships>({ following: [], followers: [] });
   const [target, setTarget] = useState(""), [busy, setBusy] = useState(false), [error, setError] = useState(""), [message, setMessage] = useState("");
   const generation = useRef(0), relationshipSnapshot = useRef("");
+  const [sharedAuthor, setSharedAuthor] = useState(""), [sharedId, setSharedId] = useState(""), [unavailable, setUnavailable] = useState(0);
   const [networkStatus, setNetworkStatus] = useState("checking"), [blocked, setBlocked] = useState<string[]>([]);
   const [progress, setProgress] = useState<Record<string, { target: string; state: string; attempts: number; last_error: string | null }[]>>({});
   const friends = audienceWallets("friends", relations);
   const audience = audienceWallets(distribution, relations, [...selectedPeople, ...recipients.split(/[\s,]+/).filter(Boolean)]);
   async function refresh(current: number, live = false) {
     const [preferences, posts, relationships, uploads] = await Promise.all([
-      nasApi<Preferences>("social/preferences"), nasApi<{ posts: PostSummary[]; network_delivery: string }>(`posts?mine=${page === "publish"}`), nasApi<Relationships>("social/relationships"),
+      nasApi<Preferences>("social/preferences"), nasApi<{ posts: PostSummary[]; network_delivery: string; unavailable_posts?: number }>(`posts?mine=${page === "publish"}`), nasApi<Relationships>("social/relationships"),
       page === "publish" ? nasApi<{ media: Media[] }>("media") : Promise.resolve({ media: [] }),
     ]);
     if (generation.current !== current) return;
     if (!live) setPrefs(preferences);
-    setItems(posts.posts); setNetworkStatus(posts.network_delivery); setRelations(relationships); setPending(uploads.media);
+    setUnavailable(posts.unavailable_posts ?? 0); setItems(posts.posts); setNetworkStatus(posts.network_delivery); setRelations(relationships); setPending(uploads.media);
     const snapshot = JSON.stringify(relationships);
     if (relationshipSnapshot.current !== snapshot) { setConfirmed(false); relationshipSnapshot.current = snapshot; }
   }
@@ -141,12 +213,18 @@ export function Publishing({ owner, page }: { owner: string; page: "publish" | "
         <div className="people-options">{(peopleTab === "friends" ? friends : relations.following).map(value => <label className="checkbox-row" key={value}><input type="checkbox" checked={selectedPeople.includes(value)} disabled={busy} onChange={event => setSelectedPeople(previous => event.target.checked ? [...previous, value] : previous.filter(item => item !== value))} /><span className="key-value">{value}</span></label>)}{!(peopleTab === "friends" ? friends : relations.following).length && <p>No wallets in this list yet. You can enter an address below.</p>}</div>
         <label>Add wallet addresses<textarea rows={2} value={recipients} disabled={busy} onChange={event => setRecipients(event.target.value)} placeholder="0x… separated by commas or new lines" /></label>
       </section>}
-      {distribution !== "broadcast" && <details className="audience-review" open><summary>{audience.length} recipient{audience.length === 1 ? "" : "s"} · Review before signing</summary>{!audience.length ? <p>No recipients available for this scope.</p> : audience.map(value => <p key={value} className="key-value">{value}</p>)}<p>Recipients are fixed when you sign. Future relationship changes do not change this post's audience. Maximum 32.</p></details>}
-      <p className="composer-policy">{distribution === "broadcast" ? "This is a public post. Uploaded files stay private until you sign and confirm publication." : "This post is private to the reviewed recipients. Content is encrypted and media access uses the same audience permissions."}</p>
+      {distribution !== "broadcast" && <details className="audience-review" open><summary>{audience.length} recipient{audience.length === 1 ? "" : "s"} · Review before signing</summary>{!audience.length ? <p>No recipients available for this scope.</p> : audience.map(value => <p key={value} className="key-value">{value}</p>)}<p>Initial delivery recipients are signed. Following access uses current relationships; you can change access after publication. Maximum 32 delivery recipients.</p></details>}
+      <p className="composer-policy">{distribution === "broadcast" ? "This is a public post. Uploaded files stay private until you sign and confirm publication." : "Initial delivery is encrypted to the reviewed recipients. Access uses current following rules where applicable and can be changed after publication."}</p>
       <label className="checkbox-row"><input type="checkbox" checked={confirmed} disabled={busy} onChange={event => { event.stopPropagation(); setConfirmed(event.target.checked); }} />I confirm publication of this content and audience. A signature authorizes this publication.</label>
       <button className="button primary" disabled={busy || !confirmed} type="submit">{busy ? "Processing…" : "Sign and publish"}</button>
     </form>}
     {page === "publish" && pending.some(file => !media.some(selected => selected.id === file.id)) && <details className="content-panel"><summary>Unused uploads from earlier drafts</summary><p>Resume an upload or remove it to free storage. These files are visible only to you.</p>{pending.filter(file => !media.some(selected => selected.id === file.id)).map(file => <div className="relationship-row" key={file.id}><span>{file.mime} · {(file.size / 1024 / 1024).toFixed(1)} MiB</span><div className="binding-actions"><button type="button" className="button demo" disabled={busy} onClick={() => { const video = file.mime.startsWith("video/"); if (media.length && (video || media.some(item => item.mime.startsWith("video/")) || media.length >= 9)) { setError("Choose up to 9 images or one video."); return; } setMode(video ? "video" : "images"); setMedia(previous => [...previous, file]); setConfirmed(false); }}>Use in this post</button><button type="button" className="button demo" disabled={busy} onClick={() => void run(async () => { await nasApi(`media/${file.id}/discard`, {}); })}>Remove</button></div></div>)}</details>}
+    {unavailable > 0 && <p role="status">Some uncached posts are unavailable because their authors could not confirm current access.</p>}
+    {page === "feed" && <details className="content-panel"><summary>Open a shared work</summary><label>Author wallet<input value={sharedAuthor} onChange={event => setSharedAuthor(event.target.value)} /></label><label>Post ID<input value={sharedId} onChange={event => setSharedId(event.target.value)} /></label><button className="button demo" disabled={busy || !sharedAuthor || !sharedId} onClick={() => void run(async () => {
+      addressBytes(sharedAuthor); if (!/^1220[0-9a-f]{64}$/.test(sharedId)) throw new Error("Enter a valid post ID.");
+      const value = await nasApi<PostDetail>(`posts/${sharedId}?author=${encodeURIComponent(sharedAuthor)}`);
+      setSelected({ id: sharedId, author: sharedAuthor, title: value.intent.action.post.title, distribution: value.intent.action.post.distribution, created_at: value.intent.issued_at, published: true }); setDetail(value);
+    }, false)}>Open work</button><p>The author must permit access and be reachable.</p></details>}
     {page === "feed" && <details className="content-panel"><summary>Receive posts from</summary>{(Object.keys(prefs) as (keyof Preferences)[]).map(name => <label className="checkbox-row" key={name}><input type="checkbox" checked={prefs[name]} disabled={busy} onChange={event => setPrefs({ ...prefs, [name]: event.target.checked })} />{{ broadcasts: "Network broadcasts", following: "People I follow", followers: "People who follow me", direct: "Posts addressed to me" }[name]}</label>)}<p>Selected sources are combined. Reception does not override audience permissions.</p><button className="button demo" disabled={busy} onClick={() => void run(async () => { await nasApi("social/preferences", prefs); setMessage("Reception preferences saved."); })}>Save reception preferences</button></details>}
     {page === "relationships" && <section className="content-panel"><h2>Following and followers</h2><p>Follow changes are signed and synchronized with the target NAS when reachable.</p><label>Wallet address<input value={target} disabled={busy} onChange={event => setTarget(event.target.value)} /></label><button className="button primary" disabled={busy || !target} onClick={() => void run(async () => { await submitAction(owner, { action: "follow", target: addressBytes(target), enabled: true }); setTarget(""); setMessage("Follow confirmed."); })}>Sign and follow</button><h3>Following</h3>{!relations.following.length && <p>No followed wallets yet.</p>}{relations.following.map(value => <div className="relationship-row" key={value}><span>{value}{friends.includes(value) ? " · Friend" : ""}</span><button className="button demo" disabled={busy} onClick={() => void run(async () => { await submitAction(owner, { action: "follow", target: addressBytes(value), enabled: false }); setMessage("Unfollow confirmed."); })}>Unfollow</button></div>)}<h3>Followers</h3>{relations.followers.map(value => <p className="key-value" key={value}>{value}</p>)}<h3>Blocked wallets</h3><p>Blocked authors cannot passively deliver posts to your inbox.</p><button className="button demo" disabled={busy || !target} onClick={() => void run(async () => { addressBytes(target); await nasApi("social/blocks", { target, blocked: true }); setBlocked((await nasApi<{ blocked: string[] }>("social/blocks")).blocked); setTarget(""); setMessage("Wallet blocked."); })}>Block entered wallet</button>{blocked.map(value => <div className="relationship-row" key={value}><span>{value}</span><button className="button demo" disabled={busy} onClick={() => void run(async () => { await nasApi("social/blocks", { target: value, blocked: false }); setBlocked(previous => previous.filter(item => item !== value)); })}>Unblock</button></div>)}</section>}
     {page !== "relationships" && <><div className="binding-actions note-list-heading"><h2>{page === "publish" ? "My notes" : "Latest notes"}</h2><button className="button demo" disabled={busy} onClick={() => void run(async () => {})}>Refresh</button></div>{!items.length && <div className="notes-empty">No posts in this view yet.</div>}
@@ -154,11 +232,11 @@ export function Publishing({ owner, page }: { owner: string; page: "publish" | "
         <button className={`note-cover ${cover ? "" : "text-cover"}`} disabled={busy} onClick={() => void run(() => read(post), false)} aria-label={`Open ${preview?.title ?? post.title}`}>
           {cover ? <MediaView file={cover} path={`posts/${post.id}/media/${cover.id}`} /> : preview ? <div><FileText size={24} /><h3>{preview.title}</h3><p>{preview.body}</p></div> : <div><FileText size={30} /><span>Post preview unavailable</span></div>}
           {cover?.mime.startsWith("video/") && <span className="cover-indicator"><Video size={17} /></span>}{(preview?.media?.length ?? 0) > 1 && <span className="cover-indicator">1 / {preview!.media!.length}</span>}
-        </button><div className="note-card-copy"><span className="note-scope">{scopes[post.distribution as Distribution] ?? post.distribution}</span><button className="note-title" disabled={busy} onClick={() => void run(() => read(post), false)}>{preview?.title ?? post.title}</button><div className="note-card-meta"><span>{shortAddress(post.author)}</span><time>{new Date(post.created_at * 1000).toLocaleDateString()}</time></div>
+        </button><div className="note-card-copy"><span className="note-scope">Initial distribution · {scopes[post.distribution as Distribution] ?? post.distribution}</span><button className="note-title" disabled={busy} onClick={() => void run(() => read(post), false)}>{preview?.title ?? post.title}</button><div className="note-card-meta"><span>{shortAddress(post.author)}</span><time>{new Date(post.created_at * 1000).toLocaleDateString()}</time></div>
         {page === "publish" && post.published && <div className="delivery-progress"><p>{Object.entries(post.delivery ?? {}).map(([state, count]) => `${state.replaceAll("_", " ")}: ${count}`).join(" · ") || "Preparing delivery…"}</p><button className="button demo" disabled={busy} onClick={() => void run(async () => { const result = await nasApi<{ targets: { target: string; state: string; attempts: number; last_error: string | null }[] }>(`posts/${post.id}/delivery`); setProgress(previous => ({ ...previous, [post.id]: result.targets })); }, false)}>Delivery details</button>{progress[post.id]?.map(item => <p className="key-value" key={item.target}>{item.target === "broadcast" ? "Connected network" : shortAddress(item.target)} · {item.state} · attempts: {item.attempts}{item.last_error ? ` · ${item.last_error}` : ""}</p>)}</div>}
         </div></article>; })}</div>
     </>}
-    {selected && detail && <Detail key={selected.id} post={selected} value={detail} error={error} close={() => { setSelected(null); setDetail(null); }} />}
+    {selected && detail && <Detail key={selected.id} owner={owner} post={selected} value={detail} error={error} close={() => { setSelected(null); setDetail(null); }} />}
   </div>;
 }
 function explain(error: unknown) { return error instanceof Error ? error.message.slice(0, 500) : "The content request failed. Check your NAS and wallet."; }

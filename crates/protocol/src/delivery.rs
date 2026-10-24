@@ -1,4 +1,4 @@
-//! Bounded application delivery v2. It does not replace the lower-level wire protocol.
+//! Bounded application delivery v4. It does not replace the lower-level wire protocol.
 use crate::{
     Address, ContentId, Error, NetworkScope, Result,
     encryption::{KeyEnvelope, Sealed},
@@ -6,7 +6,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL: &str = "/red-leaves/delivery/2.0.0";
+pub const PROTOCOL: &str = "/red-leaves/delivery/4.0.0";
 pub const CHUNK: usize = 256 * 1024;
 pub const MAX_MESSAGE: usize = 384 * 1024;
 
@@ -57,6 +57,20 @@ pub enum Request {
         #[serde(with = "serde_bytes")]
         signature: Vec<u8>,
     },
+    Like {
+        #[serde(with = "serde_bytes")]
+        payload: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        signature: Vec<u8>,
+    },
+    Access {
+        id: ContentId,
+        viewer: Address,
+    },
+    Likes {
+        id: ContentId,
+        viewer: Address,
+    },
     MediaStart {
         id: ContentId,
         viewer: Address,
@@ -74,6 +88,9 @@ pub enum Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Response {
+    Access {
+        revision: u64,
+    },
     Saved {
         body: bool,
     },
@@ -82,6 +99,10 @@ pub enum Response {
         sealed: Sealed,
         envelope: KeyEnvelope,
         signature: String,
+    },
+    Likes {
+        sealed: Sealed,
+        envelope: KeyEnvelope,
     },
     Media {
         token: String,

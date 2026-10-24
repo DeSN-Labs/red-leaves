@@ -46,8 +46,18 @@ pub async fn open(url: &str) -> Result<SqlitePool, Box<dyn std::error::Error + S
                 .execute(&mut *tx)
                 .await?;
         }
-        6 => {}
+        6..=8 => {}
         _ => return Err("Unsupported database schema version. Use an empty database or a matching node version.".into()),
+    }
+    if version == 0 || version == 6 {
+        sqlx::raw_sql(include_str!("likes.sql"))
+            .execute(&mut *tx)
+            .await?;
+    }
+    if version != 8 {
+        sqlx::raw_sql(include_str!("access.sql"))
+            .execute(&mut *tx)
+            .await?;
     }
     tx.commit().await?;
     Ok(pool)

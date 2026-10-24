@@ -563,7 +563,7 @@ async fn path_from_media(setup: &Setup, id: &str) -> String {
         .unwrap()
 }
 #[tokio::test]
-async fn group_scopes_validate_relationships_and_freeze_the_signed_audience() {
+async fn group_scopes_validate_signed_delivery_and_use_current_access() {
     let setup = setup().await;
     let a = &setup.actors[0].1;
     let b = &setup.actors[1].1;
@@ -647,7 +647,7 @@ async fn group_scopes_validate_relationships_and_freeze_the_signed_audience() {
         )
         .await
         .0,
-        StatusCode::NOT_FOUND
+        StatusCode::OK
     );
     let (_, mine) = call(&setup, 0, "GET", "/api/posts?mine=true", Value::Null).await;
     assert!(
@@ -850,6 +850,554 @@ async fn post_objects_reject_obsolete_versions_and_removed_fields() {
         call(&setup, 1, "GET", &format!("/api/posts/{id}"), Value::Null)
             .await
             .0,
+        StatusCode::OK
+    );
+}
+
+fn likes_state(setup: &Setup) -> AppState {
+    super::super::app_state(
+        setup.pool.clone(),
+        Config {
+            posts: Some(setup.service.clone()),
+            listen: "127.0.0.1:0".into(),
+            domain: "localhost:5173".into(),
+            uri: "http://localhost:5173".into(),
+            peer_id: setup.rpc.profiles.values().next().unwrap().0.clone(),
+        },
+    )
+}
+async fn like_proof(setup: &Setup, actor: usize, id: &str, enabled: bool) -> Value {
+    prepare_signed(
+        setup,
+        actor,
+        Action::Like {
+            post_id: delivery::cid(id).unwrap(),
+            enabled,
+        },
+    )
+    .await
+}
+async fn accept_like(
+    setup: &Setup,
+    proof: &Value,
+) -> Result<red_leaves_protocol::delivery::Response, ApiError> {
+    let state = likes_state(setup);
+    likes::receive(
+        &state,
+        state.config.peer_id.parse().unwrap(),
+        &bytes(proof["payload"].as_str().unwrap()).unwrap(),
+        &bytes(proof["signature"].as_str().unwrap()).unwrap(),
+    )
+    .await
+}
+#[tokio::test]
+async fn likes_are_signed_deduplicated_and_newer_unlike_survives_replay() {
+    let setup = setup().await;
+    let post = publish(&setup, false).await;
+    let id = post["id"].as_str().unwrap();
+    let first = like_proof(&setup, 1, id, true).await;
+    assert_eq!(
+        call(&setup, 1, "POST", "/api/social/commit", first.clone())
+            .await
+            .0,
+        StatusCode::OK
+    );
+    accept_like(&setup, &first).await.unwrap();
+    accept_like(&setup, &first).await.unwrap();
+    let path = format!("/api/posts/{id}/likes");
+    let (status, value) = call(&setup, 1, "GET", &path, Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["count"], 1);
+    assert_eq!(value["liked"], true);
+    let unlike = like_proof(&setup, 1, id, false).await;
+    assert_eq!(
+        call(&setup, 1, "POST", "/api/social/commit", unlike.clone())
+            .await
+            .0,
+        StatusCode::OK
+    );
+    accept_like(&setup, &unlike).await.unwrap();
+    accept_like(&setup, &first).await.unwrap();
+    let (_, value) = call(&setup, 1, "GET", &path, Value::Null).await;
+    assert_eq!(value["count"], 0);
+    assert_eq!(value["liked"], false);
+    let state = likes_state(&setup);
+    likes::process(
+        state,
+        id.into(),
+        setup.actors[1].1.clone(),
+        setup.actors[0].1.clone(),
+        unlike["payload"].as_str().unwrap().into(),
+        unlike["signature"].as_str().unwrap().into(),
+        0,
+    )
+    .await;
+    let (_, value) = call(&setup, 1, "GET", &path, Value::Null).await;
+    assert!(value["pending"].is_null());
+}
+#[tokio::test]
+async fn likes_recheck_latest_author_permissions_without_cache_fallback() {
+    let setup = setup().await;
+    let post = publish(&setup, true).await;
+    let id = post["id"].as_str().unwrap();
+    let path = format!("/api/posts/{id}/likes");
+    let access = format!("{path}/access");
+    let first = like_proof(&setup, 1, id, true).await;
+    accept_like(&setup, &first).await.unwrap();
+    assert_eq!(
+        call(&setup, 1, "GET", &path, Value::Null).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&setup, 2, "GET", &path, Value::Null).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(
+            &setup,
+            1,
+            "POST",
+            &access,
+            json!({"target":setup.actors[2].1,"allowed":false})
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(
+            &setup,
+            0,
+            "POST",
+            &access,
+            json!({"target":setup.actors[1].1,"allowed":false})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&setup, 1, "GET", &path, Value::Null).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert!(accept_like(&setup, &first).await.is_err());
+    assert_eq!(
+        call(&setup, 0, "GET", &path, Value::Null).await.1["count"],
+        1
+    );
+    assert_eq!(
+        call(
+            &setup,
+            0,
+            "POST",
+            &access,
+            json!({"target":setup.actors[1].1,"allowed":true})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&setup, 1, "GET", &path, Value::Null).await.0,
+        StatusCode::OK
+    );
+    // Restoring an exception cannot expand the post's signed audience.
+    assert_eq!(
+        call(
+            &setup,
+            0,
+            "POST",
+            &access,
+            json!({"target":setup.actors[2].1,"allowed":true})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&setup, 2, "GET", &path, Value::Null).await.0,
+        StatusCode::NOT_FOUND
+    );
+    call(
+        &setup,
+        0,
+        "POST",
+        "/api/social/blocks",
+        json!({"target":setup.actors[1].1,"blocked":true}),
+    )
+    .await;
+    assert_eq!(
+        call(&setup, 1, "GET", &path, Value::Null).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+#[tokio::test]
+async fn likes_follow_current_relationships_without_changing_the_signed_post() {
+    let setup = setup().await;
+    sqlx::query("INSERT INTO social_follows(owner,target) VALUES(?,?)")
+        .bind(&setup.actors[0].1)
+        .bind(&setup.actors[1].1)
+        .execute(&setup.pool)
+        .await
+        .unwrap();
+    let Action::Publish { mut post } = draft(&setup, true) else {
+        unreachable!()
+    };
+    post.distribution = Distribution::Following;
+    let proof = prepare_signed(&setup, 0, Action::Publish { post }).await;
+    let (_, result) = call(&setup, 0, "POST", "/api/social/commit", proof).await;
+    let id = result["id"].as_str().unwrap();
+    let path = format!("/api/posts/{id}/likes");
+    assert_eq!(
+        call(&setup, 1, "GET", &path, Value::Null).await.0,
+        StatusCode::OK
+    );
+    sqlx::query("DELETE FROM social_follows")
+        .execute(&setup.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        call(&setup, 1, "GET", &path, Value::Null).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(&setup, 1, "GET", &format!("/api/posts/{id}"), Value::Null)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+}
+#[tokio::test]
+async fn likes_reject_forgery_wrong_peer_scope_and_retry_offline_author() {
+    let setup = setup().await;
+    let post = publish(&setup, false).await;
+    let id = post["id"].as_str().unwrap();
+    let proof = like_proof(&setup, 1, id, true).await;
+    let state = likes_state(&setup);
+    let payload = bytes(proof["payload"].as_str().unwrap()).unwrap();
+    let signature = bytes(proof["signature"].as_str().unwrap()).unwrap();
+    assert!(
+        likes::receive(
+            &state,
+            state.config.peer_id.parse().unwrap(),
+            &payload,
+            &[0; 65]
+        )
+        .await
+        .is_err()
+    );
+    let wrong = libp2p::identity::Keypair::generate_ed25519()
+        .public()
+        .to_peer_id();
+    assert!(
+        likes::receive(&state, wrong, &payload, &signature)
+            .await
+            .is_err()
+    );
+    let mut intent: Intent = canonical::decode(&payload, 32768).unwrap();
+    intent.scope.registry_contract = Address([9; 20]);
+    let (signature, recovery) = setup.actors[1]
+        .0
+        .sign_prehash_recoverable(&intent.signing_hash().unwrap())
+        .unwrap();
+    let signature = [signature.to_bytes().as_slice(), &[recovery.to_byte() + 27]].concat();
+    assert!(
+        likes::receive(
+            &state,
+            state.config.peer_id.parse().unwrap(),
+            &intent.encode().unwrap(),
+            &signature
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        call(&setup, 1, "POST", "/api/social/commit", proof.clone())
+            .await
+            .0,
+        StatusCode::OK
+    );
+    setup.task.abort();
+    likes::process(
+        state,
+        id.into(),
+        setup.actors[1].1.clone(),
+        setup.actors[0].1.clone(),
+        proof["payload"].as_str().unwrap().into(),
+        proof["signature"].as_str().unwrap().into(),
+        0,
+    )
+    .await;
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM social_like_sync")
+            .fetch_one(&setup.pool)
+            .await
+            .unwrap(),
+        "retrying"
+    );
+}
+
+#[tokio::test]
+async fn like_limits_reject_new_states_without_consuming_the_signing_challenge() {
+    let setup = setup().await;
+    let post = publish(&setup, false).await;
+    let id = post["id"].as_str().unwrap();
+    let proof = like_proof(&setup, 1, id, true).await;
+    sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000) INSERT INTO social_likes(post_id,owner,enabled,issued_at,nonce,payload,signature) SELECT ?,printf('test-%d',x),0,0,'','','' FROM n").bind(id).execute(&setup.pool).await.unwrap();
+    assert_eq!(
+        accept_like(&setup, &proof).await.unwrap_err().0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000) INSERT INTO social_like_sync(post_id,owner,author,enabled,issued_at,payload,signature) SELECT printf('test-%d',x),?,?,0,0,'','' FROM n").bind(&setup.actors[1].1).bind(&setup.actors[0].1).execute(&setup.pool).await.unwrap();
+    assert_eq!(
+        call(&setup, 1, "POST", "/api/social/commit", proof.clone())
+            .await
+            .0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    sqlx::query("DELETE FROM social_like_sync WHERE post_id='test-1'")
+        .execute(&setup.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        call(&setup, 1, "POST", "/api/social/commit", proof).await.0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn author_can_replace_access_without_resigning_and_likes_use_the_same_policy() {
+    let setup = setup().await;
+    let result = publish(&setup, true).await;
+    let id = result["id"].as_str().unwrap();
+    let body = format!("/api/posts/{id}");
+    let policy = format!("{body}/access");
+    let likes = format!("{body}/likes");
+    let original = call(&setup, 0, "GET", &body, Value::Null).await.1;
+    assert_eq!(
+        call(&setup, 1, "POST", &policy, json!({"level":"public"}))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(&setup, 1, "GET", &policy, Value::Null).await.0,
+        StatusCode::NOT_FOUND
+    );
+    for invalid in [
+        json!({"level":"directed"}),
+        json!({"level":"public","recipients":[setup.actors[1].1]}),
+        json!({"level":"directed","recipients":[setup.actors[0].1]}),
+        json!({"level":"directed","recipients":[setup.actors[1].1, setup.actors[1].1]}),
+        json!({"level":"directed","recipients":["0x0000000000000000000000000000000000000000"]}),
+    ] {
+        assert_eq!(
+            call(&setup, 0, "POST", &policy, invalid).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert_eq!(
+        call(&setup, 0, "POST", &policy, json!({"level":"public"}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let state = likes_state(&setup);
+    let remote = state.config.peer_id.parse().unwrap();
+    let server = delivery::Server::new(state);
+    let proofs = [
+        like_proof(&setup, 1, id, true).await,
+        like_proof(&setup, 2, id, true).await,
+    ];
+    for (level, recipients, allowed) in [
+        ("none", vec![], [false, false]),
+        ("public", vec![], [true, true]),
+        ("directed", vec![setup.actors[2].1.clone()], [false, true]),
+        ("following", vec![], [true, false]),
+        ("followers", vec![], [false, true]),
+    ] {
+        sqlx::query("INSERT OR IGNORE INTO social_follows(owner,target) VALUES(?,?),(?,?)")
+            .bind(&setup.actors[0].1)
+            .bind(&setup.actors[1].1)
+            .bind(&setup.actors[2].1)
+            .bind(&setup.actors[0].1)
+            .execute(&setup.pool)
+            .await
+            .unwrap();
+        let (status, saved) = call(
+            &setup,
+            0,
+            "POST",
+            &policy,
+            json!({"level":level,"recipients":recipients}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        let current = call(&setup, 0, "GET", &policy, Value::Null).await.1;
+        assert_eq!(current["level"], level);
+        assert_eq!(current["revision"], saved["revision"]);
+        assert_eq!(call(&setup, 0, "GET", &body, Value::Null).await.1, original);
+        for actor in 1..=2 {
+            let expected = if allowed[actor - 1] {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            assert_eq!(
+                call(&setup, actor, "GET", &body, Value::Null).await.0,
+                expected,
+                "{level}, actor {actor}"
+            );
+            assert_eq!(
+                call(&setup, actor, "GET", &likes, Value::Null).await.0,
+                expected,
+                "{level}, actor {actor} likes"
+            );
+            let authorization = server
+                .request(
+                    remote,
+                    red_leaves_protocol::delivery::Request::Access {
+                        id: delivery::cid(id).unwrap(),
+                        viewer: address(&setup.actors[actor].1).unwrap(),
+                    },
+                )
+                .await;
+            match authorization {
+                Ok(red_leaves_protocol::delivery::Response::Access { revision }) => {
+                    assert_eq!(expected, StatusCode::OK);
+                    assert_eq!(revision, current["revision"].as_u64().unwrap());
+                }
+                Err(ApiError(status, _)) => assert_eq!(status, expected),
+                _ => panic!("Unexpected access response"),
+            }
+            let outcome = accept_like(&setup, &proofs[actor - 1]).await;
+            let status = match outcome {
+                Ok(_) => StatusCode::OK,
+                Err(ApiError(status, _)) => status,
+            };
+            assert_eq!(status, expected, "{level}, actor {actor} like submission");
+        }
+        // Old delivery workers cannot acknowledge a newer access revision.
+        assert_eq!(
+            sqlx::query(
+                "UPDATE social_outbox SET state='delivered' WHERE post_id=? AND access_revision=0"
+            )
+            .bind(id)
+            .execute(&setup.pool)
+            .await
+            .unwrap()
+            .rows_affected(),
+            0
+        );
+    }
+    sqlx::query("DELETE FROM social_follows")
+        .execute(&setup.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        call(&setup, 2, "GET", &body, Value::Null).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(&setup, 2, "GET", &likes, Value::Null).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn changed_access_invalidates_active_media_grants_and_blocks_new_downloads() {
+    use red_leaves_protocol::delivery::{Request as RequestMessage, Response as ResponseMessage};
+    let setup = setup().await;
+    let image = [b"\x89PNG\r\n\x1a\n".as_slice(), &vec![42; 300_000]].concat();
+    let (status, uploaded) = media_call(&setup, 0, "POST", "/api/media", "image/png", image).await;
+    assert_eq!(status, StatusCode::OK);
+    let file: red_leaves_protocol::social::Media = serde_json::from_slice(&uploaded).unwrap();
+    let Action::Publish { mut post } = draft(&setup, true) else {
+        unreachable!()
+    };
+    post.media = vec![file.clone()];
+    let proof = prepare_signed(&setup, 0, Action::Publish { post }).await;
+    let (status, result) = call(&setup, 0, "POST", "/api/social/commit", proof).await;
+    assert_eq!(status, StatusCode::OK);
+    let id = result["id"].as_str().unwrap();
+    let state = likes_state(&setup);
+    let remote = state.config.peer_id.parse().unwrap();
+    let server = delivery::Server::new(state);
+    let request = RequestMessage::MediaStart {
+        id: delivery::cid(id).unwrap(),
+        viewer: address(&setup.actors[1].1).unwrap(),
+        media_id: file.id.clone(),
+    };
+    let ResponseMessage::Media { token, .. } =
+        server.request(remote, request.clone()).await.unwrap()
+    else {
+        panic!("Expected media grant")
+    };
+    assert!(matches!(
+        server
+            .request(
+                remote,
+                RequestMessage::MediaChunk {
+                    token: token.clone(),
+                    offset: 0
+                }
+            )
+            .await
+            .unwrap(),
+        ResponseMessage::Chunk { .. }
+    ));
+    assert_eq!(
+        call(
+            &setup,
+            0,
+            "POST",
+            &format!("/api/posts/{id}/access"),
+            json!({"level":"none"})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert!(matches!(
+        server
+            .request(
+                remote,
+                RequestMessage::MediaChunk {
+                    token,
+                    offset: 262144
+                }
+            )
+            .await,
+        Err(ApiError(StatusCode::NOT_FOUND, _))
+    ));
+    assert!(matches!(
+        server.request(remote, request).await,
+        Err(ApiError(StatusCode::NOT_FOUND, _))
+    ));
+    // Newly permitted people can fetch media even if absent from the original signed recipients.
+    assert_eq!(
+        call(
+            &setup,
+            0,
+            "POST",
+            &format!("/api/posts/{id}/access"),
+            json!({"level":"directed", "recipients":[setup.actors[2].1]})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        media_call(
+            &setup,
+            2,
+            "GET",
+            &format!("/api/posts/{id}/media/{}", file.id),
+            "image/png",
+            vec![]
+        )
+        .await
+        .0,
         StatusCode::OK
     );
 }

@@ -21,11 +21,30 @@ async fn deliver_local(
     if !local.iter().any(|o| o == target) {
         return Ok(NetResponse::Ignored);
     }
+    match super::super::access::ensure(state, &hex::encode(notice.id.as_bytes()), target).await {
+        Ok(()) => (),
+        Err(ApiError(StatusCode::NOT_FOUND, _)) => return Ok(NetResponse::Ignored),
+        Err(error) => return Err(error),
+    }
     save_inbox(state, target, notice, None).await?;
     Ok(NetResponse::Saved { body: true })
 }
 async fn deliver_post(state: &AppState, id: &str, target: &str) -> Result<&'static str, ApiError> {
-    let n = notice(state, id).await?;
+    let n = match notice(state, id).await {
+        Ok(n) => n,
+        Err(ApiError(StatusCode::NOT_FOUND, _)) => return Ok("filtered"),
+        Err(error) => return Err(error),
+    };
+    if target == "broadcast" && n.distribution != Distribution::Broadcast {
+        return Ok("filtered");
+    }
+    if target != "broadcast" {
+        match super::super::access::ensure(state, id, target).await {
+            Ok(()) => (),
+            Err(ApiError(StatusCode::NOT_FOUND, _)) => return Ok("filtered"),
+            Err(error) => return Err(error),
+        }
+    }
     if target == "broadcast" {
         for owner in local_owners(state).await? {
             deliver_local(state, &n, &owner).await?;
@@ -57,7 +76,7 @@ async fn deliver_post(state: &AppState, id: &str, target: &str) -> Result<&'stat
         _ => Err(unavailable()),
     }
 }
-async fn process_post(state: AppState, id: String, target: String, attempts: i64) {
+async fn process_post(state: AppState, id: String, target: String, attempts: i64, revision: i64) {
     let result = deliver_post(&state, &id, &target).await;
     let (status, next, error) = match result {
         Ok("announced") => ("announced", now() + 120, None),
@@ -77,8 +96,8 @@ async fn process_post(state: AppState, id: String, target: String, attempts: i64
     } else {
         tracing::info!(post_id=%id,delivery_state=status,attempt=attempts+1,"Post delivery progress updated");
     }
-    if sqlx::query("UPDATE social_outbox SET state=?,next_attempt=?,attempts=attempts+1,last_error=? WHERE post_id=? AND target=?")
-        .bind(status).bind(next).bind(error).bind(&id).bind(&target).execute(&state.pool).await.is_err(){tracing::error!("Unable to persist post delivery progress");}
+    if sqlx::query("UPDATE social_outbox SET state=?,next_attempt=?,attempts=attempts+1,last_error=? WHERE post_id=? AND target=? AND access_revision=?")
+        .bind(status).bind(next).bind(error).bind(&id).bind(&target).bind(revision).execute(&state.pool).await.is_err(){tracing::error!("Unable to persist post delivery progress");}
     if let Ok(n) = notice(&state, &id).await
         && let Ok(service) = service(&state)
     {
@@ -176,8 +195,12 @@ pub(in crate::api) fn start(
             tokio::select! {
                 _=tick.tick()=>{
                     if work.len()>=4{continue;}
-                    let rows=sqlx::query("SELECT post_id,target,attempts FROM social_outbox WHERE state IN ('pending_network','retrying','announced') AND next_attempt<=? ORDER BY next_attempt,post_id LIMIT 8").bind(now()).fetch_all(&state.pool).await;
-                    if let Ok(rows)=rows{for row in rows{if work.len()>=4{break;}let id:String=row.get("post_id");let target:String=row.get("target");let key=format!("post/{id}/{target}");if !inflight.insert(key.clone()){continue;}let state=state.clone();work.spawn(async move{process_post(state,id,target,row.get("attempts")).await;key});}}else{tracing::error!("Unable to load pending post deliveries");}
+                    let rows=sqlx::query("SELECT post_id,target,attempts,access_revision FROM social_outbox WHERE state IN ('pending_network','retrying','announced') AND next_attempt<=? ORDER BY next_attempt,post_id LIMIT 8").bind(now()).fetch_all(&state.pool).await;
+                    if let Ok(rows)=rows{for row in rows{if work.len()>=4{break;}let id:String=row.get("post_id");let target:String=row.get("target");let key=format!("post/{id}/{target}");if !inflight.insert(key.clone()){continue;}let state=state.clone();work.spawn(async move{process_post(state,id,target,row.get("attempts"),row.get("access_revision")).await;key});}}else{tracing::error!("Unable to load pending post deliveries");}
+                    if work.len()<4 {
+                        let rows=sqlx::query("SELECT * FROM social_like_sync WHERE state IN ('pending','retrying') AND next_attempt<=? ORDER BY next_attempt LIMIT 4").bind(now()).fetch_all(&state.pool).await;
+                        if let Ok(rows)=rows{for row in rows{if work.len()>=4{break;}let owner:String=row.get("owner");let id:String=row.get("post_id");let key=format!("like/{owner}/{id}");if !inflight.insert(key.clone()){continue;}let state=state.clone();work.spawn(async move{likes::process(state,id,owner,row.get("author"),row.get("payload"),row.get("signature"),row.get("attempts")).await;key});}}else{tracing::error!("Unable to load pending like synchronization");}
+                    }
                     if work.len()<4 {
                         let rows=sqlx::query("SELECT * FROM social_follow_sync WHERE state IN ('pending','retrying') AND next_attempt<=? ORDER BY next_attempt LIMIT 4").bind(now()).fetch_all(&state.pool).await;
                         if let Ok(rows)=rows{for row in rows{if work.len()>=4{break;}let owner:String=row.get("owner");let target:String=row.get("target");let key=format!("follow/{owner}/{target}");if !inflight.insert(key.clone()){continue;}let state=state.clone();work.spawn(async move{process_follow(state,owner,target,row.get("payload"),row.get("signature"),row.get("attempts")).await;key});}}else{tracing::error!("Unable to load pending follow synchronization");}

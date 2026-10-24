@@ -38,7 +38,7 @@ async fn current_schema_initializes_and_reopens_without_migration() {
             .fetch_one(&pool)
             .await
             .unwrap(),
-        6
+        8
     );
     let row =
         sqlx::query("SELECT state,attempts,next_attempt FROM social_outbox WHERE post_id='post'")
@@ -63,7 +63,7 @@ async fn unsupported_schema_versions_are_rejected_without_being_reinterpreted() 
         (1, "PRAGMA user_version=1"),
         (4, "PRAGMA user_version=4"),
         (5, "PRAGMA user_version=5"),
-        (7, "PRAGMA user_version=7"),
+        (9, "PRAGMA user_version=9"),
     ] {
         let url = format!(
             "sqlite://{}?mode=rwc",
@@ -93,5 +93,114 @@ async fn unsupported_schema_versions_are_rejected_without_being_reinterpreted() 
         );
         pool.close().await;
     }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn version_six_adds_likes_without_losing_existing_posts() {
+    let root = std::env::temp_dir().join(format!(
+        "red-leaves-likes-upgrade-{}",
+        crate::identity::secret().unwrap()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let url = format!("sqlite://{}?mode=rwc", root.join("db.sqlite").display());
+    let pool = SqlitePool::connect(&url).await.unwrap();
+    sqlx::raw_sql(include_str!("schema.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO social_posts(id,author,title,distribution,audience_scope,created_at,published,object_path) VALUES('post','author','Title','broadcast','broadcast',1,1,'object')").execute(&pool).await.unwrap();
+    pool.close().await;
+    let pool = open(&url).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        8
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM social_posts")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM social_likes")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    pool.close().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn version_seven_seeds_access_and_preserves_likes_and_delivery() {
+    let root = std::env::temp_dir().join(format!(
+        "red-leaves-access-upgrade-{}",
+        crate::identity::secret().unwrap()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let url = format!("sqlite://{}?mode=rwc", root.join("db.sqlite").display());
+    let pool = SqlitePool::connect(&url).await.unwrap();
+    sqlx::raw_sql(include_str!("schema.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("likes.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO social_posts(id,author,title,distribution,audience_scope,created_at,published,object_path) VALUES('post','author','','directed','friends',1,1,'object')").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO social_recipients(post_id,recipient) VALUES('post','viewer')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO social_outbox(post_id,target) VALUES('post','viewer')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let pool = open(&url).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT level FROM social_post_access WHERE post_id='post'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        "directed"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT viewer FROM social_post_access_recipients WHERE post_id='post'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        "viewer"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT access_revision FROM social_outbox WHERE post_id='post'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        0
+    );
+    pool.close().await;
+    let pool = open(&url).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        8
+    );
+    pool.close().await;
     std::fs::remove_dir_all(root).unwrap();
 }

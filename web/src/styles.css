@@ -1314,3 +1314,6 @@ img {
 .delivery-progress { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 10px; }
 .delivery-progress p { font-size: 10px; line-height: 1.7; color: #7a876e; }
 .delivery-progress .button { font-size: 10px; padding: 7px 10px; }
+.post-likes { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--line); }
+.post-likes p { font-size: 12px; line-height: 1.7; }
+.post-likes input { display: block; width: 100%; box-sizing: border-box; margin: 8px 0; padding: 9px; border: 1px solid var(--line); border-radius: 8px; }

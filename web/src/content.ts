@@ -6,12 +6,12 @@ import { registryAddress, registryAbi } from "./registry.ts";
 export type Distribution = "broadcast" | "following" | "followers" | "friends" | "directed";
 export type Media = { id: string; mime: string; size: number; digest: string };
 export type Draft = { title: string; body: string; distribution: Distribution; recipients: number[][]; media?: Media[] };
-export type SocialAction = { action: "publish"; post: Draft } | { action: "follow"; target: number[]; enabled: boolean };
+export type SocialAction = { action: "publish"; post: Draft } | { action: "follow"; target: number[]; enabled: boolean } | { action: "like"; post_id: number[]; enabled: boolean };
 export type Preferences = { broadcasts: boolean; following: boolean; followers: boolean; direct: boolean };
 export type PostSummary = { id: string; author: string; title: string; distribution: string; created_at: number; published: boolean; preview?: Draft | null; delivery?: Record<string, number> };
 export type PostStatus = { id: string; status: "saved_pending_network"; author: Address };
 export type ActionStatus = PostStatus | { status: "saved" };
-export type PostDetail = { id: string; intent: { action: { action: "publish"; post: Draft } }; signature: string };
+export type PostDetail = { id: string; intent: { issued_at: number; action: { action: "publish"; post: Draft } }; signature: string };
 export type Relationships = { following: string[]; followers: string[] };
 export function audienceWallets(distribution: Distribution, relationships: Relationships, selected: string[] = []): string[] {
   const following = relationships.following.map(value => value.toLowerCase()), followers = relationships.followers.map(value => value.toLowerCase());
@@ -73,7 +73,7 @@ export async function submitAction(owner: string, action: SocialAction): Promise
   const nas = await getNasInfo();
   if (!actionsMatch(intent.action, action)) throw new Error("The NAS changed the action. Nothing was signed.");
   if (bytesToHex(new Uint8Array(intent.actor)).toLowerCase() !== owner.toLowerCase() || intent.nas_peer_id !== nas.peer_id || intent.scope.chain_id !== 84532 || bytesToHex(new Uint8Array(intent.scope.registry_contract)).toLowerCase() !== registryAddress.toLowerCase() || intent.scope.protocol_family !== "red-leaves" || intent.scope.network_version !== 1 || intent.expires_at <= Date.now() / 1000 || intent.expires_at - intent.issued_at > 900) throw new Error("The NAS returned an invalid signing scope.");
-  const typedAction = intent.action.action === "publish" ? { action: "publish", post: { ...intent.action.post, recipients: intent.action.post.recipients.map(value => new Uint8Array(value)) } } : { ...intent.action, target: new Uint8Array(intent.action.target) };
+  const typedAction = intent.action.action === "publish" ? { action: "publish", post: { ...intent.action.post, recipients: intent.action.post.recipients.map(value => new Uint8Array(value)) } } : intent.action.action === "follow" ? { ...intent.action, target: new Uint8Array(intent.action.target) } : { ...intent.action, post_id: new Uint8Array(intent.action.post_id) };
   const encoded = encodeCanonical({ ...intent, scope: { ...intent.scope, registry_contract: new Uint8Array(intent.scope.registry_contract) }, actor: new Uint8Array(intent.actor), nonce: new Uint8Array(intent.nonce), action: typedAction } as Cbor);
   if (bytesToHex(encoded) !== prepared.payload || keccak256(encoded) !== prepared.payload_hash) throw new Error("The NAS payload does not match the reviewed action.");
   const client = await checkWallet(owner);
